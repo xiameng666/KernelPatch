@@ -1,3 +1,4 @@
+/* APatch JNI接口实现 - Android应用程序的原生接口层 */
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* 
  * Copyright (C) 2023 bmax121. All Rights Reserved.
@@ -9,95 +10,175 @@
 
 #include "../supercall.h"
 
+// Android日志标签定义
 #define LOG_TAG "APatchNative"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+/**
+ * @brief 将整数数组填充到Java ArrayList中
+ * @details 通过反射机制调用ArrayList的add方法添加Integer对象
+ * @param env JNI环境指针
+ * @param list Java ArrayList对象
+ * @param data 整数数据数组
+ * @param count 数组元素数量
+ */
 static void fillIntArray(JNIEnv *env, jobject list, int *data, int count)
 {
-    auto cls = env->GetObjectClass(list);
-    auto add = env->GetMethodID(cls, "add", "(Ljava/lang/Object;)Z");
-    auto integerCls = env->FindClass("java/lang/Integer");
-    auto constructor = env->GetMethodID(integerCls, "<init>", "(I)V");
+    auto cls = env->GetObjectClass(list);                           // 获取ArrayList类
+    auto add = env->GetMethodID(cls, "add", "(Ljava/lang/Object;)Z"); // 获取add方法ID
+    auto integerCls = env->FindClass("java/lang/Integer");          // 查找Integer类
+    auto constructor = env->GetMethodID(integerCls, "<init>", "(I)V"); // 获取构造函数
+    
     for (int i = 0; i < count; ++i) {
+        // 创建Integer对象并添加到ArrayList
         auto integer = env->NewObject(integerCls, constructor, data[i]);
         env->CallBooleanMethod(list, add, integer);
     }
 }
 
+/**
+ * @brief 向Java ArrayList中添加单个整数
+ * @param env JNI环境指针
+ * @param list Java ArrayList对象
+ * @param ele 要添加的整数元素
+ */
 static void addIntToList(JNIEnv *env, jobject list, int ele)
 {
-    auto cls = env->GetObjectClass(list);
-    auto add = env->GetMethodID(cls, "add", "(Ljava/lang/Object;)Z");
-    auto integerCls = env->FindClass("java/lang/Integer");
-    auto constructor = env->GetMethodID(integerCls, "<init>", "(I)V");
-    auto integer = env->NewObject(integerCls, constructor, ele);
-    env->CallBooleanMethod(list, add, integer);
+    auto cls = env->GetObjectClass(list);                           // 获取ArrayList类
+    auto add = env->GetMethodID(cls, "add", "(Ljava/lang/Object;)Z"); // 获取add方法
+    auto integerCls = env->FindClass("java/lang/Integer");          // 查找Integer类
+    auto constructor = env->GetMethodID(integerCls, "<init>", "(I)V"); // 获取构造函数
+    auto integer = env->NewObject(integerCls, constructor, ele);     // 创建Integer对象
+    env->CallBooleanMethod(list, add, integer);                     // 添加到列表
 }
 
+/**
+ * @brief 获取Java List的大小
+ * @param env JNI环境指针
+ * @param list Java List对象
+ * @return 列表中的元素数量
+ */
 static int getListSize(JNIEnv *env, jobject list)
 {
-    auto cls = env->GetObjectClass(list);
-    auto size = env->GetMethodID(cls, "size", "()I");
-    return env->CallIntMethod(list, size);
+    auto cls = env->GetObjectClass(list);            // 获取List类
+    auto size = env->GetMethodID(cls, "size", "()I"); // 获取size方法
+    return env->CallIntMethod(list, size);           // 调用size方法获取大小
 }
 
+/**
+ * @brief 检查KernelPatch是否已准备就绪
+ * @param env JNI环境指针
+ * @param clz Java类引用
+ * @param superKey 超级调用密钥字符串
+ * @return 成功返回true，失败返回false
+ */
 extern "C" JNIEXPORT jboolean JNICALL Java_me_bmax_apatch_Natives_nativeReady(JNIEnv *env, jclass clz, jstring superKey)
 {
-    if (!superKey) return -EINVAL;
-    const char *skey = env->GetStringUTFChars(superKey, NULL);
-    bool rc = sc_ready(skey);
-    env->ReleaseStringUTFChars(superKey, skey);
+    if (!superKey) return -EINVAL;  // 检查参数有效性
+    
+    const char *skey = env->GetStringUTFChars(superKey, NULL);  // 获取UTF-8字符串
+    bool rc = sc_ready(skey);  // 调用超级调用检查就绪状态
+    env->ReleaseStringUTFChars(superKey, skey);  // 释放字符串资源
+    
     return rc;
 }
 
+/**
+ * @brief 获取KernelPatch版本号
+ * @param env JNI环境指针
+ * @param clz Java类引用
+ * @param superKey 超级调用密钥字符串
+ * @return 版本号或错误码
+ */
 extern "C" JNIEXPORT jint JNICALL Java_me_bmax_apatch_Natives_nativeKernelPatchVersion(JNIEnv *env, jclass clz,
                                                                                        jstring superKey)
 {
-    if (!superKey) return -EINVAL;
-    const char *skey = env->GetStringUTFChars(superKey, NULL);
-    uint32_t version = sc_kp_ver(skey);
-    env->ReleaseStringUTFChars(superKey, skey);
+    if (!superKey) return -EINVAL;  // 参数检查
+    
+    const char *skey = env->GetStringUTFChars(superKey, NULL);  // 获取密钥字符串
+    uint32_t version = sc_kp_ver(skey);  // 调用超级调用获取版本
+    env->ReleaseStringUTFChars(superKey, skey);  // 释放资源
+    
     return version;
 }
 
+/**
+ * @brief 执行用户权限提升操作
+ * @param env JNI环境指针
+ * @param clz Java类引用
+ * @param superKey 超级调用密钥字符串
+ * @param to_uid 目标用户ID
+ * @param scontext SELinux安全上下文
+ * @return 操作结果，成功返回0，失败返回负数错误码
+ */
 extern "C" JNIEXPORT jlong JNICALL Java_me_bmax_apatch_Natives_nativeSu(JNIEnv *env, jclass clz, jstring superKey,
                                                                         jint to_uid, jstring scontext)
 {
-    if (!superKey) return -EINVAL;
-    const char *skey = env->GetStringUTFChars(superKey, NULL);
+    if (!superKey) return -EINVAL;  // 检查必要参数
+    
+    const char *skey = env->GetStringUTFChars(superKey, NULL);  // 获取密钥
     const char *sctx = 0;
-    if (scontext) sctx = env->GetStringUTFChars(scontext, NULL);
+    if (scontext) sctx = env->GetStringUTFChars(scontext, NULL);  // 获取安全上下文（可选）
+    
+    // 构建su配置信息
     struct su_profile profile = { 0 };
-    profile.uid = getuid();
-    profile.to_uid = (uid_t)to_uid;
-    if (sctx) strncpy(profile.scontext, sctx, sizeof(profile.scontext) - 1);
-    long rc = sc_su(skey, &profile);
-    if (rc < 0) LOGE("nativeSu error: %ld\n", rc);
+    profile.uid = getuid();         // 当前用户ID
+    profile.to_uid = (uid_t)to_uid; // 目标用户ID
+    if (sctx) strncpy(profile.scontext, sctx, sizeof(profile.scontext) - 1);  // 设置安全上下文
+    
+    long rc = sc_su(skey, &profile);  // 执行超级调用su操作
+    if (rc < 0) LOGE("nativeSu error: %ld\n", rc);  // 记录错误日志
+    
+    // 释放字符串资源
     env->ReleaseStringUTFChars(superKey, skey);
     if (sctx) env->ReleaseStringUTFChars(scontext, sctx);
+    
     return rc;
 }
 
+/**
+ * @brief 对指定线程执行权限提升操作
+ * @param env JNI环境指针
+ * @param clz Java类引用
+ * @param superKey 超级调用密钥字符串
+ * @param tid 目标线程ID
+ * @param to_uid 目标用户ID
+ * @param scontext SELinux安全上下文
+ * @return 操作结果
+ */
 extern "C" JNIEXPORT jlong JNICALL Java_me_bmax_apatch_Natives_nativeThreadSu(JNIEnv *env, jclass clz, jstring superKey,
                                                                               jint tid, jint to_uid, jstring scontext)
 {
-    const char *skey = env->GetStringUTFChars(superKey, NULL);
+    const char *skey = env->GetStringUTFChars(superKey, NULL);  // 获取密钥
     const char *sctx = 0;
-    if (scontext) sctx = env->GetStringUTFChars(scontext, NULL);
+    if (scontext) sctx = env->GetStringUTFChars(scontext, NULL);  // 获取安全上下文
+    
+    // 构建su配置信息
     struct su_profile profile = { 0 };
-    profile.uid = getuid();
-    profile.to_uid = (uid_t)to_uid;
-    if (sctx) strncpy(profile.scontext, sctx, sizeof(profile.scontext) - 1);
-    long rc = sc_su_task(skey, tid, &profile);
+    profile.uid = getuid();         // 当前用户ID
+    profile.to_uid = (uid_t)to_uid; // 目标用户ID
+    if (sctx) strncpy(profile.scontext, sctx, sizeof(profile.scontext) - 1);  // 设置安全上下文
+    
+    long rc = sc_su_task(skey, tid, &profile);  // 对指定任务执行su操作
+    
+    // 释放资源
     env->ReleaseStringUTFChars(superKey, skey);
     env->ReleaseStringUTFChars(scontext, sctx);
+    
     return rc;
 }
 
+/**
+ * @brief 获取已提权用户的数量
+ * @param env JNI环境指针
+ * @param clz Java类引用
+ * @param superKey 超级调用密钥字符串
+ * @return 提权用户数量
+ */
 extern "C" JNIEXPORT jint JNICALL Java_me_bmax_apatch_Natives_nativeSuNums(JNIEnv *env, jclass clz, jstring superKey)
 {
-    const char *skey = env->GetStringUTFChars(superKey, NULL);
+    const char *skey = env->GetStringUTFChars(superKey, NULL);  // 获取密钥
     long rc = sc_su_uid_nums(skey);
     env->ReleaseStringUTFChars(superKey, skey);
     return rc;

@@ -1,32 +1,34 @@
 /*********************************************************************
-* Filename:   sha256.c
-* Author:     Brad Conte (brad AT bradconte.com)
-* Copyright:
-* Disclaimer: This code is presented "as is" without any guarantees.
-* Details:    Implementation of the SHA-256 hashing algorithm.
-              SHA-256 is one of the three algorithms in the SHA2
-              specification. The others, SHA-384 and SHA-512, are not
-              offered in this implementation.
-              Algorithm specification can be found here:
-               * http://csrc.nist.gov/publications/fips/fips180-2/fips180-2withchangenotice.pdf
-              This implementation uses little endian byte order.
+* 文件名:    sha256.c
+* 作者:      Brad Conte (brad AT bradconte.com)
+* 版权:
+* 免责声明:  此代码按"原样"提供，不提供任何保证。
+* 详细信息:  SHA-256哈希算法的实现。
+            SHA-256是SHA2规范中的三种算法之一。其他两种SHA-384和SHA-512
+            在此实现中未提供。
+            算法规范可在此处找到：
+             * http://csrc.nist.gov/publications/fips/fips180-2/fips180-2withchangenotice.pdf
+            此实现使用小端字节序。
 *********************************************************************/
 
-/*************************** HEADER FILES ***************************/
+// SHA256哈希算法实现 - 用于根密钥验证和安全计算
+
+/*************************** 头文件 ***************************/
 #include "sha256.h"
 
-/****************************** MACROS ******************************/
-#define ROTLEFT(a, b) (((a) << (b)) | ((a) >> (32 - (b))))
-#define ROTRIGHT(a, b) (((a) >> (b)) | ((a) << (32 - (b))))
+/****************************** 宏定义 ******************************/
+#define ROTLEFT(a, b) (((a) << (b)) | ((a) >> (32 - (b))))   // 左循环移位
+#define ROTRIGHT(a, b) (((a) >> (b)) | ((a) << (32 - (b))))  // 右循环移位
 
-#define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define EP0(x) (ROTRIGHT(x, 2) ^ ROTRIGHT(x, 13) ^ ROTRIGHT(x, 22))
-#define EP1(x) (ROTRIGHT(x, 6) ^ ROTRIGHT(x, 11) ^ ROTRIGHT(x, 25))
-#define SIG0(x) (ROTRIGHT(x, 7) ^ ROTRIGHT(x, 18) ^ ((x) >> 3))
-#define SIG1(x) (ROTRIGHT(x, 17) ^ ROTRIGHT(x, 19) ^ ((x) >> 10))
+#define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))               // 选择函数
+#define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z))) // 多数函数
+#define EP0(x) (ROTRIGHT(x, 2) ^ ROTRIGHT(x, 13) ^ ROTRIGHT(x, 22))  // Σ0函数
+#define EP1(x) (ROTRIGHT(x, 6) ^ ROTRIGHT(x, 11) ^ ROTRIGHT(x, 25))  // Σ1函数
+#define SIG0(x) (ROTRIGHT(x, 7) ^ ROTRIGHT(x, 18) ^ ((x) >> 3))      // σ0函数
+#define SIG1(x) (ROTRIGHT(x, 17) ^ ROTRIGHT(x, 19) ^ ((x) >> 10))    // σ1函数
 
-/**************************** VARIABLES *****************************/
+/**************************** 变量 *****************************/
+// SHA-256算法使用的64个32位常数（前64个素数的立方根的分数部分）
 static const WORD k[64] = { 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
                             0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
                             0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
@@ -38,16 +40,20 @@ static const WORD k[64] = { 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x39
                             0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
                             0xc67178f2 };
 
-/*********************** FUNCTION DEFINITIONS ***********************/
+/*********************** 函数定义 ***********************/
+// SHA-256压缩函数 - 处理512位数据块
 void sha256_transform(SHA256_CTX *ctx, const BYTE data[])
 {
     WORD a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];
 
+    // 将输入数据转换为64个32位字（大端序）
     for (i = 0, j = 0; i < 16; ++i, j += 4)
         m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
+    // 扩展前16个字到64个字
     for (; i < 64; ++i)
         m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
 
+    // 初始化工作变量为当前哈希值
     a = ctx->state[0];
     b = ctx->state[1];
     c = ctx->state[2];
@@ -57,10 +63,11 @@ void sha256_transform(SHA256_CTX *ctx, const BYTE data[])
     g = ctx->state[6];
     h = ctx->state[7];
 
+    // 主循环：64轮压缩运算
     for (i = 0; i < 64; ++i) {
-        t1 = h + EP1(e) + CH(e, f, g) + k[i] + m[i];
-        t2 = EP0(a) + MAJ(a, b, c);
-        h = g;
+        t1 = h + EP1(e) + CH(e, f, g) + k[i] + m[i];  // 临时值1
+        t2 = EP0(a) + MAJ(a, b, c);                    // 临时值2
+        h = g;                                         // 循环移位
         g = f;
         f = e;
         e = d + t1;
@@ -70,6 +77,7 @@ void sha256_transform(SHA256_CTX *ctx, const BYTE data[])
         a = t1 + t2;
     }
 
+    // 将压缩结果加到当前哈希值上
     ctx->state[0] += a;
     ctx->state[1] += b;
     ctx->state[2] += c;
@@ -80,10 +88,12 @@ void sha256_transform(SHA256_CTX *ctx, const BYTE data[])
     ctx->state[7] += h;
 }
 
+// 初始化SHA-256上下文
 void sha256_init(SHA256_CTX *ctx)
 {
-    ctx->datalen = 0;
-    ctx->bitlen = 0;
+    ctx->datalen = 0;   // 数据长度
+    ctx->bitlen = 0;    // 位长度
+    // 设置初始哈希值（前8个素数的平方根的分数部分）
     ctx->state[0] = 0x6a09e667;
     ctx->state[1] = 0xbb67ae85;
     ctx->state[2] = 0x3c6ef372;
@@ -94,63 +104,66 @@ void sha256_init(SHA256_CTX *ctx)
     ctx->state[7] = 0x5be0cd19;
 }
 
+// 向SHA-256上下文添加数据
 void sha256_update(SHA256_CTX *ctx, const BYTE data[], size_t len)
 {
     WORD i;
 
+    // 逐字节处理输入数据
     for (i = 0; i < len; ++i) {
-        ctx->data[ctx->datalen] = data[i];
+        ctx->data[ctx->datalen] = data[i];  // 存储数据
         ctx->datalen++;
-        if (ctx->datalen == 64) {
-            sha256_transform(ctx, ctx->data);
-            ctx->bitlen += 512;
-            ctx->datalen = 0;
+        if (ctx->datalen == 64) {           // 缓冲区满64字节时处理
+            sha256_transform(ctx, ctx->data);   // 执行压缩函数
+            ctx->bitlen += 512;                 // 增加位计数
+            ctx->datalen = 0;                   // 重置缓冲区
         }
     }
 }
 
+// 完成SHA-256计算并输出哈希值
 void sha256_final(SHA256_CTX *ctx, BYTE hash[])
 {
     WORD i;
 
     i = ctx->datalen;
 
-    // Pad whatever data is left in the buffer.
-    if (ctx->datalen < 56) {
-        ctx->data[i++] = 0x80;
-        while (i < 56)
+    // 添加填充：首先添加一个1位（0x80）
+    if (ctx->datalen < 56) {        // 如果剩余空间足够
+        ctx->data[i++] = 0x80;      // 添加0x80
+        while (i < 56)              // 用0填充到56字节
             ctx->data[i++] = 0x00;
-    } else {
-        ctx->data[i++] = 0x80;
-        while (i < 64)
+    } else {                        // 如果剩余空间不够
+        ctx->data[i++] = 0x80;      // 添加0x80
+        while (i < 64)              // 用0填充到64字节
             ctx->data[i++] = 0x00;
-        sha256_transform(ctx, ctx->data);
-        for (int i = 0; i < 56; i++)
+        sha256_transform(ctx, ctx->data);  // 处理当前块
+        for (int i = 0; i < 56; i++)       // 清空新块的前56字节
             ctx->data[i] = 0;
     }
 
-    // Append to the padding the total message's length in bits and transform.
+    // 在填充末尾添加原始消息的总长度（以位为单位，大端序）
     ctx->bitlen += ctx->datalen * 8;
-    ctx->data[63] = ctx->bitlen;
-    ctx->data[62] = ctx->bitlen >> 8;
+    ctx->data[63] = ctx->bitlen;         // 低8位
+    ctx->data[62] = ctx->bitlen >> 8;    // 次低8位
     ctx->data[61] = ctx->bitlen >> 16;
     ctx->data[60] = ctx->bitlen >> 24;
     ctx->data[59] = ctx->bitlen >> 32;
     ctx->data[58] = ctx->bitlen >> 40;
     ctx->data[57] = ctx->bitlen >> 48;
-    ctx->data[56] = ctx->bitlen >> 56;
-    sha256_transform(ctx, ctx->data);
+    ctx->data[56] = ctx->bitlen >> 56;   // 高8位
+    sha256_transform(ctx, ctx->data);    // 处理最后一块
 
-    // Since this implementation uses little endian byte ordering and SHA uses big endian,
-    // reverse all the bytes when copying the final state to the output hash.
+    // 由于此实现使用小端字节序而SHA使用大端序，
+    // 在将最终状态复制到输出哈希时需要反转所有字节
     for (i = 0; i < 4; ++i) {
-        hash[i] = (ctx->state[0] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 4] = (ctx->state[1] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 8] = (ctx->state[2] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 20] = (ctx->state[5] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 24] = (ctx->state[6] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 28] = (ctx->state[7] >> (24 - i * 8)) & 0x000000ff;
+        hash[i] = (ctx->state[0] >> (24 - i * 8)) & 0x000000ff;      // 状态字0
+        hash[i + 4] = (ctx->state[1] >> (24 - i * 8)) & 0x000000ff;  // 状态字1
+        hash[i + 8] = (ctx->state[2] >> (24 - i * 8)) & 0x000000ff;  // 状态字2
+        hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0x000000ff; // 状态字3
+        hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0x000000ff; // 状态字4
+        hash[i + 20] = (ctx->state[5] >> (24 - i * 8)) & 0x000000ff; // 状态字5
+        hash[i + 24] = (ctx->state[6] >> (24 - i * 8)) & 0x000000ff; // 状态字6
+        hash[i + 28] = (ctx->state[7] >> (24 - i * 8)) & 0x000000ff; // 状态字7
     }
 }

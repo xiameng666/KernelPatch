@@ -1,7 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
-/* 
- * Copyright (C) 2023 bmax121. All Rights Reserved.
- */
+// 超级用户权限管理器
 
 #include "sumgr.h"
 #include <unistd.h>
@@ -12,7 +9,15 @@
 
 #include "../supercall.h"
 
-int su_grant(const char *key, uid_t to_uid, const char *scontext)
+/**
+ * 授予用户超级用户权限
+ * @param key 超级调用密钥
+ * @param uid 源用户ID
+ * @param to_uid 目标用户ID
+ * @param scontext SELinux安全上下文
+ * @return 成功返回0，失败返回错误码
+ */
+int su_grant(const char *key, uid_t uid, uid_t to_uid, const char *scontext)
 {
     struct su_profile profile = { 0 };
     profile.uid = uid;
@@ -25,12 +30,23 @@ int su_grant(const char *key, uid_t to_uid, const char *scontext)
     return rc;
 }
 
+/**
+ * 撤销用户的超级用户权限
+ * @param key 超级调用密钥
+ * @param uid 用户ID
+ * @return 成功返回0，失败返回错误码
+ */
 int su_revoke(const char *key, uid_t uid)
 {
     int rc = sc_su_revoke_uid(key, uid);
     return rc;
 }
 
+/**
+ * 获取拥有超级用户权限的用户数量
+ * @param key 超级调用密钥
+ * @return 成功返回用户数量，失败返回错误码
+ */
 int su_nums(const char *key)
 {
     int nums = sc_su_uid_nums(key);
@@ -38,6 +54,11 @@ int su_nums(const char *key)
     return 0;
 }
 
+/**
+ * 列出所有拥有超级用户权限的用户ID
+ * @param key 超级调用密钥
+ * @return 成功返回0，失败返回错误码
+ */
 int su_list(const char *key)
 {
     uid_t uids[256];
@@ -51,6 +72,12 @@ int su_list(const char *key)
     return rc;
 }
 
+/**
+ * 获取指定用户的超级用户权限配置
+ * @param key 超级调用密钥
+ * @param uid 用户ID
+ * @return 成功返回0，失败返回错误码
+ */
 int su_profile(const char *key, uid_t uid)
 {
     struct su_profile profile = { 0 };
@@ -60,12 +87,23 @@ int su_profile(const char *key, uid_t uid)
     return 0;
 }
 
+/**
+ * 重置su命令路径
+ * @param key 超级调用密钥
+ * @param path 新的su命令路径
+ * @return 成功返回0，失败返回错误码
+ */
 int su_reset_path(const char *key, const char *path)
 {
     int rc = sc_su_reset_path(key, path);
     return rc;
 }
 
+/**
+ * 获取当前su命令路径
+ * @param key 超级调用密钥
+ * @return 成功返回0，失败返回错误码
+ */
 int su_get_path(const char *key)
 {
     char buf[SU_PATH_MAX_LEN];
@@ -80,6 +118,10 @@ int su_get_path(const char *key)
 extern const char program_name[];
 extern const char *key;
 
+/**
+ * 显示使用说明
+ * @param status 退出状态码
+ */
 void usage(int status)
 {
     if (status != EXIT_SUCCESS)
@@ -107,6 +149,12 @@ void usage(int status)
     exit(status);
 }
 
+/**
+ * 超级用户管理器主函数
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 执行结果
+ */
 int sumgr_main(int argc, char **argv)
 {
     if (argc < 2) usage(EXIT_FAILURE);
@@ -114,6 +162,7 @@ int sumgr_main(int argc, char **argv)
     const char *scmd = argv[1];
     int cmd = -1;
 
+    // 命令映射表
     struct
     {
         const char *scmd;
@@ -123,6 +172,7 @@ int sumgr_main(int argc, char **argv)
                     { "profile", SUPERCALL_SU_PROFILE }, { "reset", SUPERCALL_SU_RESET_PATH },
                     { "path", SUPERCALL_SU_GET_PATH },   { "help", 0 } };
 
+    // 查找匹配的命令
     for (int i = 0; i < sizeof(cmd_arr) / sizeof(cmd_arr[0]); i++) {
         if (strcmp(scmd, cmd_arr[i].scmd)) continue;
         cmd = cmd_arr[i].cmd;
@@ -137,32 +187,33 @@ int sumgr_main(int argc, char **argv)
     const char *sctx = NULL;
     const char *path = NULL;
 
+    // 根据命令执行相应操作
     switch (cmd) {
-    case SUPERCALL_SU_GRANT_UID:
+    case SUPERCALL_SU_GRANT_UID:  // 授予权限
         if (argc < 3) error(-EINVAL, 0, "uid does not exist");
         uid = (uid_t)atoi(argv[2]);
         if (argc >= 4) to_uid = (uid_t)atoi(argv[3]);
         if (argc >= 5) sctx = argv[4];
         return su_grant(key, uid, to_uid, sctx);
-    case SUPERCALL_SU_REVOKE_UID:
+    case SUPERCALL_SU_REVOKE_UID:  // 撤销权限
         if (argc < 3) error(-EINVAL, 0, "uid does not exist");
         uid = (uid_t)atoi(argv[2]);
         return su_revoke(key, uid);
-    case SUPERCALL_SU_NUMS:
+    case SUPERCALL_SU_NUMS:  // 获取数量
         return su_nums(key);
-    case SUPERCALL_SU_LIST:
+    case SUPERCALL_SU_LIST:  // 列出用户
         return su_list(key);
-    case SUPERCALL_SU_PROFILE:
+    case SUPERCALL_SU_PROFILE:  // 获取配置
         if (argc < 3) error(-EINVAL, 0, "uid does not exist");
         uid = (uid_t)atoi(argv[2]);
         return su_profile(key, uid);
-    case SUPERCALL_SU_RESET_PATH:
+    case SUPERCALL_SU_RESET_PATH:  // 重置路径
         if (argc < 3) error(-EINVAL, 0, "path does not exist");
         path = argv[2];
         return su_reset_path(key, path);
-    case SUPERCALL_SU_GET_PATH:
+    case SUPERCALL_SU_GET_PATH:  // 获取路径
         return su_get_path(key);
-    case 0:
+    case 0:  // 帮助
         usage(EXIT_SUCCESS);
     default:
         usage(EXIT_FAILURE);

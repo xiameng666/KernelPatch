@@ -1,0 +1,510 @@
+//------------------------------------------------
+//--- 010 Editor v2.0 Binary Template
+//
+//      File: Arm64Kernel.bt
+//   Authors: feicong
+//   Version: 1.0
+//   Purpose: Parse Android ARM64 GKI (Generic Kernel Image) kernel files
+//            based on the ARM64 Linux kernel booting specification.
+//            Supports parsing of the 64-byte kernel header structure
+//            including flags, magic numbers, and reserved fields.
+//  Category: Kernel/Firmware
+// File Mask: Image,kernel
+//  ID Bytes: [+60] 41 52 4D 64
+//   History:
+//   1.0   2025-09-11 feicong: Initial release。
+//------------------------------------------------
+
+// Color definitions for better visualization
+#define HEADER_COLOR    0x90EE90  // Light Green
+#define CODE_COLOR      0x87CEEB  // Sky Blue  
+#define OFFSET_COLOR    0xFFB6C1  // Light Pink
+#define SIZE_COLOR      0xDDA0DD  // Plum
+#define FLAGS_COLOR     0xF0E68C  // Khaki
+#define MAGIC_COLOR     0xFF6347  // Tomato
+#define RESERVED_COLOR  0xD3D3D3  // Light Gray
+
+// ARM64 Kernel Magic Number (little endian "ARM\x64")
+#define ARM64_MAGIC     0x644d5241
+
+// Local variables for validation
+local uint32 detected_magic;
+local int is_valid_kernel = 0;
+
+// Kernel endianness enumeration
+typedef enum <uchar> {
+    KERNEL_LITTLE_ENDIAN = 0,
+    KERNEL_BIG_ENDIAN = 1
+} kernel_endian_e;
+
+// Kernel page size enumeration  
+typedef enum <uchar> {
+    PAGE_SIZE_UNSPECIFIED = 0,
+    PAGE_SIZE_4K = 1,
+    PAGE_SIZE_16K = 2, 
+    PAGE_SIZE_64K = 3
+} kernel_page_size_e;
+
+// Physical placement enumeration
+typedef enum <uchar> {
+    PLACEMENT_2MB_ALIGNED_DRAM_BASE = 0,
+    PLACEMENT_2MB_ALIGNED_48BIT_RANGE = 1
+} kernel_placement_e;
+
+// Kernel flags structure with bit breakdown (exactly 8 bytes)
+typedef struct {
+    uchar endianness : 1 <comment="Bit 0: Kernel endianness (0=LE, 1=BE)">;
+    uchar page_size : 2 <comment="Bit 1-2: Page size (0=unspec, 1=4K, 2=16K, 3=64K)">;
+    uchar placement : 1 <comment="Bit 3: Physical placement method">;
+    uchar reserved_low : 4 <comment="Bit 4-7: Reserved low bits">;
+    uchar reserved_bytes[7] <comment="Bytes 1-7: Reserved (must be 0)">;
+} kernel_flags_t <bgcolor=FLAGS_COLOR>;
+
+// ARM64 Kernel Image Header (64 bytes total)
+typedef struct {
+    // Executable code section (8 bytes)
+    uint32 code0 <bgcolor=CODE_COLOR, comment="Executable code - branch to stext">;
+    uint32 code1 <bgcolor=CODE_COLOR, comment="Executable code - branch to stext">;
+    
+    // Image layout information (16 bytes)
+    uint64 text_offset <bgcolor=OFFSET_COLOR, comment="Image load offset from 2MB aligned base">;
+    uint64 image_size <bgcolor=SIZE_COLOR, comment="Effective size of kernel image">;
+    
+    // Kernel configuration flags (8 bytes)
+    kernel_flags_t flags <comment="Kernel flags with bit breakdown">;
+    
+    // Reserved fields (24 bytes)
+    uint64 res2 <bgcolor=RESERVED_COLOR, comment="Reserved field 2 (must be 0)">;
+    uint64 res3 <bgcolor=RESERVED_COLOR, comment="Reserved field 3 (must be 0)">;  
+    uint64 res4 <bgcolor=RESERVED_COLOR, comment="Reserved field 4 (must be 0)">;
+    
+    // Magic number and final reserved field (8 bytes)
+    uint32 magic <bgcolor=MAGIC_COLOR, comment="Magic number: 0x644d5241 ('ARM\\x64')">;
+    uint32 res5 <bgcolor=RESERVED_COLOR, comment="Reserved field 5 (PE COFF offset for EFI)">;
+} arm64_kernel_header_t <bgcolor=HEADER_COLOR>;
+
+// Function to validate kernel header
+string ValidateKernelHeader(arm64_kernel_header_t &header) {
+    local string result = "";
+    
+    // Check magic number
+    if (header.magic == ARM64_MAGIC) {
+        result += "✓ Valid ARM64 kernel magic number\n";
+        is_valid_kernel = 1;
+    } else {
+        result += "✗ Invalid magic number (expected 0x644d5241)\n";
+    }
+    
+    // Check reserved fields
+    if (header.res2 == 0 && header.res3 == 0 && header.res4 == 0) {
+        result += "✓ Reserved fields are properly zeroed\n";
+    } else {
+        result += "⚠ Warning: Reserved fields contain non-zero values\n";
+    }
+    
+    // Validate text_offset alignment
+    if ((header.text_offset & 0x1FFFFF) == 0) {
+        result += "✓ Text offset is 2MB aligned\n";
+    } else {
+        result += "⚠ Warning: Text offset is not 2MB aligned\n";
+    }
+    
+    return result;
+}
+
+// Function to describe PE/COFF machine types
+string DescribeMachineType(uint16 machine) {
+    local string result = "";
+    switch (machine) {
+        case 0x014c: result = "IMAGE_FILE_MACHINE_I386 (x86)"; break;
+        case 0x0200: result = "IMAGE_FILE_MACHINE_IA64 (Intel Itanium)"; break;
+        case 0x8664: result = "IMAGE_FILE_MACHINE_AMD64 (x64)"; break;
+        case 0xAA64: result = "IMAGE_FILE_MACHINE_ARM64 (ARM64)"; break;
+        case 0x01c0: result = "IMAGE_FILE_MACHINE_ARM (ARM)"; break;
+        case 0x01c4: result = "IMAGE_FILE_MACHINE_ARMNT (ARM Thumb-2)"; break;
+        default: 
+            local string temp;
+            SPrintf(temp, "Unknown machine type (0x%04X)", machine);
+            result = temp;
+            break;
+    }
+    return result;
+}
+
+// Function to describe PE/COFF characteristics
+string DescribeCharacteristics(uint16 characteristics) {
+    local string result = "";
+    
+    if (characteristics & 0x0001) result += "RELOCS_STRIPPED ";
+    if (characteristics & 0x0002) result += "EXECUTABLE_IMAGE ";
+    if (characteristics & 0x0004) result += "LINE_NUMS_STRIPPED ";
+    if (characteristics & 0x0008) result += "LOCAL_SYMS_STRIPPED ";
+    if (characteristics & 0x0010) result += "AGGR_WS_TRIM ";
+    if (characteristics & 0x0020) result += "LARGE_ADDRESS_AWARE ";
+    if (characteristics & 0x0080) result += "BYTES_REVERSED_LO ";
+    if (characteristics & 0x0100) result += "32BIT_MACHINE ";
+    if (characteristics & 0x0200) result += "DEBUG_STRIPPED ";
+    if (characteristics & 0x0400) result += "REMOVABLE_RUN_FROM_SWAP ";
+    if (characteristics & 0x0800) result += "NET_RUN_FROM_SWAP ";
+    if (characteristics & 0x1000) result += "SYSTEM ";
+    if (characteristics & 0x2000) result += "DLL ";
+    if (characteristics & 0x4000) result += "UP_SYSTEM_ONLY ";
+    if (characteristics & 0x8000) result += "BYTES_REVERSED_HI ";
+    
+    return result;
+}
+
+// Function to describe subsystem types
+string DescribeSubsystem(uint16 subsystem) {
+    local string result = "";
+    switch (subsystem) {
+        case 0: result = "IMAGE_SUBSYSTEM_UNKNOWN"; break;
+        case 1: result = "IMAGE_SUBSYSTEM_NATIVE"; break;
+        case 2: result = "IMAGE_SUBSYSTEM_WINDOWS_GUI"; break;
+        case 3: result = "IMAGE_SUBSYSTEM_WINDOWS_CUI"; break;
+        case 5: result = "IMAGE_SUBSYSTEM_OS2_CUI"; break;
+        case 7: result = "IMAGE_SUBSYSTEM_POSIX_CUI"; break;
+        case 9: result = "IMAGE_SUBSYSTEM_WINDOWS_CE_GUI"; break;
+        case 10: result = "IMAGE_SUBSYSTEM_EFI_APPLICATION"; break;
+        case 11: result = "IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER"; break;
+        case 12: result = "IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER"; break;
+        case 13: result = "IMAGE_SUBSYSTEM_EFI_ROM"; break;
+        case 14: result = "IMAGE_SUBSYSTEM_XBOX"; break;
+        case 16: result = "IMAGE_SUBSYSTEM_WINDOWS_BOOT_APPLICATION"; break;
+        default:
+            local string temp;
+            SPrintf(temp, "Unknown subsystem (%d)", subsystem);
+            result = temp;
+            break;
+    }
+    return result;
+}
+
+// Function to describe kernel flags
+string DescribeKernelFlags(kernel_flags_t &flags) {
+    local string result = "";
+    local uchar endianness = flags.endianness;
+    local uchar page_size = flags.page_size;
+    local uchar placement = flags.placement;
+    
+    // Check if reserved bits are zero
+    local int reserved_ok = (flags.reserved_low == 0);
+    local int i;
+    for (i = 0; i < 7; i++) {
+        if (flags.reserved_bytes[i] != 0) {
+            reserved_ok = 0;
+            break;
+        }
+    }
+    
+    // Show raw flags value first (reconstructed from bits)
+    local string temp_str;
+    local uint64 raw_flags = (placement << 3) | (page_size << 1) | endianness;
+    SPrintf(temp_str, "Raw flags value: 0x%016X\n", raw_flags);
+    result += temp_str;
+    
+    // Bit breakdown
+    result += "\nBit breakdown:\n";
+    SPrintf(temp_str, "  Bit 0 (Endianness): %d ", endianness);
+    result += temp_str;
+    if (endianness == KERNEL_LITTLE_ENDIAN) {
+        result += "(Little Endian)\n";
+    } else {
+        result += "(Big Endian)\n";
+    }
+    
+    SPrintf(temp_str, "  Bit 1-2 (Page Size): %d ", page_size);
+    result += temp_str;
+    switch (page_size) {
+        case PAGE_SIZE_UNSPECIFIED:
+            result += "(Unspecified)\n";
+            break;
+        case PAGE_SIZE_4K:
+            result += "(4KB)\n";
+            break;
+        case PAGE_SIZE_16K:
+            result += "(16KB)\n";
+            break;
+        case PAGE_SIZE_64K:
+            result += "(64KB)\n";
+            break;
+    }
+    
+    SPrintf(temp_str, "  Bit 3 (Placement): %d ", placement);
+    result += temp_str;
+    if (placement == PLACEMENT_2MB_ALIGNED_DRAM_BASE) {
+        result += "(2MB aligned, close to DRAM base)\n";
+    } else {
+        result += "(2MB aligned, within 48-bit addressable range)\n";
+    }
+    
+    SPrintf(temp_str, "  Bit 4-63 (Reserved): ");
+    result += temp_str;
+    if (reserved_ok) {
+        result += "(✓ Properly zeroed)\n";
+    } else {
+        result += "(⚠ Non-zero reserved bits!)\n";
+    }
+    
+    return result;
+}
+
+//------------------------------------------------
+// Main parsing logic
+//------------------------------------------------
+LittleEndian();
+
+// Ensure we're at the beginning of the file
+FSeek(0);
+
+// Parse the ARM64 kernel header
+arm64_kernel_header_t kernel_header <comment="ARM64 Kernel Image Header (64 bytes)">;
+
+// No need for separate flags parsing - it's now embedded in the main structure
+
+// Validate the header
+Printf("=== ARM64 Kernel Header Analysis ===\n");
+Printf("%s", ValidateKernelHeader(kernel_header));
+Printf("\n=== Kernel Configuration ===\n");
+Printf("%s", DescribeKernelFlags(kernel_header.flags));
+
+// Display key information
+Printf("\n=== Key Information ===\n");
+Printf("Text Offset: 0x%08X (%u bytes)\n", kernel_header.text_offset, kernel_header.text_offset);
+Printf("Image Size: 0x%08X (%u bytes)\n", kernel_header.image_size, kernel_header.image_size);
+Printf("Magic Number: 0x%08X\n", kernel_header.magic);
+
+if (is_valid_kernel) {
+    Printf("\n✓ This appears to be a valid ARM64 kernel image.\n");
+} else {
+    Printf("\n✗ This does not appear to be a valid ARM64 kernel image.\n");
+}
+
+// Extended kernel header structure for PE/COFF and EFI support
+typedef struct {
+    // PE/COFF Header (starts at offset 0x40)
+    uchar pe_signature[2] <bgcolor=0xFFE4B5, comment="PE signature 'PE' (0x50 0x45)">;
+    uchar reserved1[2] <bgcolor=RESERVED_COLOR, comment="Reserved bytes">;
+    
+    // COFF File Header
+    uint16 machine <bgcolor=0xDDA0DD, comment="Target machine type">;
+    uint16 number_of_sections <bgcolor=0xDDA0DD, comment="Number of sections">;
+    uint32 time_date_stamp <bgcolor=0xDDA0DD, comment="Time/date stamp">;
+    uint32 pointer_to_symbol_table <bgcolor=0xDDA0DD, comment="Pointer to symbol table">;
+    uint32 number_of_symbols <bgcolor=0xDDA0DD, comment="Number of symbols">;
+    uint16 size_of_optional_header <bgcolor=0xDDA0DD, comment="Size of optional header">;
+    uint16 characteristics <bgcolor=FLAGS_COLOR, comment="File characteristics">;
+    
+    // Optional Header (PE32+)
+    uint16 magic <bgcolor=MAGIC_COLOR, comment="PE32+ magic (0x020B)">;
+    uchar major_linker_version <bgcolor=0xF0E68C, comment="Major linker version">;
+    uchar minor_linker_version <bgcolor=0xF0E68C, comment="Minor linker version">;
+    uint32 size_of_code <bgcolor=SIZE_COLOR, comment="Size of code section">;
+    uint32 size_of_initialized_data <bgcolor=SIZE_COLOR, comment="Size of initialized data">;
+    uint32 size_of_uninitialized_data <bgcolor=SIZE_COLOR, comment="Size of uninitialized data">;
+    uint32 address_of_entry_point <bgcolor=OFFSET_COLOR, comment="Entry point RVA">;
+    uint32 base_of_code <bgcolor=OFFSET_COLOR, comment="Base of code RVA">;
+    
+    // PE32+ specific fields
+    uint64 image_base <bgcolor=OFFSET_COLOR, comment="Preferred load address">;
+    uint32 section_alignment <bgcolor=0xF0E68C, comment="Section alignment">;
+    uint32 file_alignment <bgcolor=0xF0E68C, comment="File alignment">;
+    uint16 major_os_version <bgcolor=0xF0E68C, comment="Major OS version">;
+    uint16 minor_os_version <bgcolor=0xF0E68C, comment="Minor OS version">;
+    uint16 major_image_version <bgcolor=0xF0E68C, comment="Major image version">;
+    uint16 minor_image_version <bgcolor=0xF0E68C, comment="Minor image version">;
+    uint16 major_subsystem_version <bgcolor=0xF0E68C, comment="Major subsystem version">;
+    uint16 minor_subsystem_version <bgcolor=0xF0E68C, comment="Minor subsystem version">;
+    uint32 win32_version_value <bgcolor=RESERVED_COLOR, comment="Win32 version value">;
+    uint32 size_of_image <bgcolor=SIZE_COLOR, comment="Size of image">;
+    uint32 size_of_headers <bgcolor=SIZE_COLOR, comment="Size of headers">;
+    uint32 checksum <bgcolor=0xF0E68C, comment="Image checksum">;
+    uint16 subsystem <bgcolor=0xF0E68C, comment="Subsystem">;
+    uint16 dll_characteristics <bgcolor=FLAGS_COLOR, comment="DLL characteristics">;
+    uint64 size_of_stack_reserve <bgcolor=SIZE_COLOR, comment="Stack reserve size">;
+    uint64 size_of_stack_commit <bgcolor=SIZE_COLOR, comment="Stack commit size">;
+    uint64 size_of_heap_reserve <bgcolor=SIZE_COLOR, comment="Heap reserve size">;
+    uint64 size_of_heap_commit <bgcolor=SIZE_COLOR, comment="Heap commit size">;
+    uint32 loader_flags <bgcolor=FLAGS_COLOR, comment="Loader flags">;
+    uint32 number_of_rva_and_sizes <bgcolor=0xF0E68C, comment="Number of data directories">;
+} extended_kernel_header_t <bgcolor=0xE6E6FA>;
+
+// Data Directory Entry
+typedef struct {
+    uint32 virtual_address <bgcolor=OFFSET_COLOR, comment="RVA of data">;
+    uint32 size <bgcolor=SIZE_COLOR, comment="Size of data">;
+} data_directory_entry_t <bgcolor=0xF5F5DC>;
+
+// Section Header
+typedef struct {
+    char name[8] <bgcolor=0xFFB6C1, comment="Section name">;
+    uint32 virtual_size <bgcolor=SIZE_COLOR, comment="Virtual size">;
+    uint32 virtual_address <bgcolor=OFFSET_COLOR, comment="Virtual address">;
+    uint32 size_of_raw_data <bgcolor=SIZE_COLOR, comment="Size of raw data">;
+    uint32 pointer_to_raw_data <bgcolor=OFFSET_COLOR, comment="Pointer to raw data">;
+    uint32 pointer_to_relocations <bgcolor=OFFSET_COLOR, comment="Pointer to relocations">;
+    uint32 pointer_to_line_numbers <bgcolor=OFFSET_COLOR, comment="Pointer to line numbers">;
+    uint16 number_of_relocations <bgcolor=0xF0E68C, comment="Number of relocations">;
+    uint16 number_of_line_numbers <bgcolor=0xF0E68C, comment="Number of line numbers">;
+    uint32 characteristics <bgcolor=FLAGS_COLOR, comment="Section characteristics">;
+} section_header_t <bgcolor=0xE0FFFF>;
+
+// Parse kernel body if present
+if (FileSize() > 64) {
+    Printf("\n=== Extended Kernel Header Analysis ===\n");
+    Printf("Extended header size: %u bytes\n", FileSize() - 64);
+    
+    // Check if we have PE/COFF header at offset 0x40
+    FSeek(64);
+    local uchar pe_check[4];
+    ReadBytes(pe_check, FTell(), 4);
+    
+    if (pe_check[0] == 0x50 && pe_check[1] == 0x45) {  // "PE" signature
+        Printf("PE/COFF header detected at offset 0x40\n");
+        
+        // Parse extended header
+        FSeek(64);
+        extended_kernel_header_t extended_header <comment="Extended PE/COFF kernel header">;
+        
+        // Parse data directories if present
+        if (extended_header.number_of_rva_and_sizes > 0) {
+            Printf("Parsing %d data directories...\n", extended_header.number_of_rva_and_sizes);
+            
+            local int i;
+            for (i = 0; i < extended_header.number_of_rva_and_sizes && i < 16; i++) {
+                data_directory_entry_t data_dir <comment="Data directory entry">;
+            }
+        }
+        
+        // Parse section headers if present
+        if (extended_header.number_of_sections > 0) {
+            Printf("Parsing %d section headers...\n", extended_header.number_of_sections);
+            
+            local int j;
+            for (j = 0; j < extended_header.number_of_sections && j < 32; j++) {
+                section_header_t section <comment="Section header">;
+            }
+        }
+        
+        Printf("PE/COFF header parsed successfully.\n");
+        
+        // Display PE/COFF analysis
+        Printf("\n=== PE/COFF Header Analysis ===\n");
+        Printf("Machine Type: %s\n", DescribeMachineType(extended_header.machine));
+        Printf("Number of Sections: %d\n", extended_header.number_of_sections);
+        Printf("Characteristics: %s\n", DescribeCharacteristics(extended_header.characteristics));
+        Printf("Entry Point RVA: 0x%08X\n", extended_header.address_of_entry_point);
+        Printf("Image Base: 0x%016X\n", extended_header.image_base);
+        Printf("Size of Image: 0x%08X (%u bytes)\n", extended_header.size_of_image, extended_header.size_of_image);
+        Printf("Size of Headers: 0x%08X (%u bytes)\n", extended_header.size_of_headers, extended_header.size_of_headers);
+        Printf("Subsystem: %s\n", DescribeSubsystem(extended_header.subsystem));
+        Printf("Section Alignment: 0x%08X\n", extended_header.section_alignment);
+        Printf("File Alignment: 0x%08X\n", extended_header.file_alignment);
+        
+    } else {
+        Printf("No PE/COFF header found, checking for compression...\n");
+        
+        // Check for common compression formats
+        FSeek(64);
+        local uchar compression_header[4];
+        ReadBytes(compression_header, FTell(), 4);
+        
+        // Detect compression type
+        if (compression_header[0] == 0x1F && compression_header[1] == 0x8B) {
+        Printf("Compression: GZIP detected\n");
+        
+        // Parse GZIP header
+        typedef struct {
+            uchar magic1 <comment="GZIP magic 0x1F">;
+            uchar magic2 <comment="GZIP magic 0x8B">;
+            uchar compression_method <comment="Compression method (8=deflate)">;
+            uchar flags <comment="GZIP flags">;
+            uint32 mtime <comment="Modification time">;
+            uchar extra_flags <comment="Extra flags">;
+            uchar os_type <comment="Operating system type">;
+        } gzip_header_t <bgcolor=0xFFE4B5>;
+        
+        FSeek(64);
+        gzip_header_t gzip_header <comment="GZIP compressed kernel data header">;
+        
+        // Remaining compressed data
+        local uint32 compressed_size = FileSize() - FTell();
+        if (compressed_size > 0) {
+            uchar compressed_data[compressed_size] <bgcolor=0xF0F8FF, comment="GZIP compressed kernel image data">;
+        }
+        
+    } else if (compression_header[0] == 0x42 && compression_header[1] == 0x5A && 
+               compression_header[2] == 0x68) {
+        Printf("Compression: BZIP2 detected\n");
+        
+        // Parse BZIP2 header
+        typedef struct {
+            uchar magic[3] <comment="BZIP2 magic 'BZh'">;
+            uchar block_size <comment="Block size (1-9)">;
+        } bzip2_header_t <bgcolor=0xFFE4B5>;
+        
+        FSeek(64);
+        bzip2_header_t bzip2_header <comment="BZIP2 compressed kernel data header">;
+        
+        // Remaining compressed data
+        local uint32 compressed_size = FileSize() - FTell();
+        if (compressed_size > 0) {
+            uchar compressed_data[compressed_size] <bgcolor=0xF0F8FF, comment="BZIP2 compressed kernel image data">;
+        }
+        
+    } else if (compression_header[0] == 0xFD && compression_header[1] == 0x37 && 
+               compression_header[2] == 0x7A && compression_header[3] == 0x58) {
+        Printf("Compression: XZ detected\n");
+        
+        // Parse XZ header
+        typedef struct {
+            uchar magic[6] <comment="XZ magic">;
+            uchar flags[2] <comment="XZ flags">;
+        } xz_header_t <bgcolor=0xFFE4B5>;
+        
+        FSeek(64);
+        xz_header_t xz_header <comment="XZ compressed kernel data header">;
+        
+        // Remaining compressed data
+        local uint32 compressed_size = FileSize() - FTell();
+        if (compressed_size > 0) {
+            uchar compressed_data[compressed_size] <bgcolor=0xF0F8FF, comment="XZ compressed kernel image data">;
+        }
+        
+    } else if (compression_header[0] == 0x28 && compression_header[1] == 0xB5 && 
+               compression_header[2] == 0x2F && compression_header[3] == 0xFD) {
+        Printf("Compression: ZSTD detected\n");
+        
+        // Parse ZSTD header
+        typedef struct {
+            uint32 magic <comment="ZSTD magic 0xFD2FB528">;
+            uchar frame_header_descriptor <comment="Frame header descriptor">;
+        } zstd_header_t <bgcolor=0xFFE4B5>;
+        
+        FSeek(64);
+        zstd_header_t zstd_header <comment="ZSTD compressed kernel data header">;
+        
+        // Remaining compressed data
+        local uint32 compressed_size = FileSize() - FTell();
+        if (compressed_size > 0) {
+            uchar compressed_data[compressed_size] <bgcolor=0xF0F8FF, comment="ZSTD compressed kernel image data">;
+        }
+        
+    } else {
+        Printf("Compression: Unknown or uncompressed\n");
+        Printf("First 4 bytes: %02X %02X %02X %02X\n", 
+               compression_header[0], compression_header[1], 
+               compression_header[2], compression_header[3]);
+        
+        // Parse as raw kernel data
+        FSeek(64);
+        local uint32 kernel_data_size = FileSize() - 64;
+        uchar kernel_data[kernel_data_size] <bgcolor=0xF0F8FF, comment="Raw kernel image data">;
+    }
+    
+    Printf("Kernel body parsed successfully.\n");
+    }
+} else {
+    Printf("\n=== No Kernel Body ===\n");
+    Printf("File contains only the 64-byte header.\n");
+}

@@ -1,0 +1,33 @@
+# Git 相关文件
+.git
+.gitignore
+.github
+
+# 构建产物
+build/
+*.o
+*.elf
+kpimg
+kpimg-*
+kptools
+kptools-*
+*.kpm
+
+# 临时文件
+*~
+*.tmp
+*.log
+
+# macOS 特定文件
+.DS_Store
+
+# 文档文件
+*.md
+doc/
+
+# 许可证文件
+LICENSE
+
+# 其他不需要的文件
+banner
+doxyfile

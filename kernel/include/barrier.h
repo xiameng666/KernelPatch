@@ -1,20 +1,22 @@
+// ARM64内存屏障定义头文件
 #ifndef _KP_BARRIER_H_
 #define _KP_BARRIER_H_
 
+// 完整内存屏障，确保所有内存访问按顺序执行
 #define mb() asm volatile("dmb ish" ::: "memory")
+// 写内存屏障，确保写操作按顺序执行
 #define wmb() asm volatile("dmb ishst" ::: "memory")
+// 读内存屏障，确保读操作按顺序执行
 #define rmb() asm volatile("dmb ishld" ::: "memory")
 
-/*
- * Kernel uses dmb variants on arm64 for smp_*() barriers. Pretty much the same
- * implementation as above mb()/wmb()/rmb(), though for the latter kernel uses
- * dsb. In any case, should above mb()/wmb()/rmb() change, make sure the below
- * smp_*() don't.
- */
+// SMP多核环境下的内存屏障，与内核实现保持一致
+// 内核在ARM64上使用dmb变体实现SMP屏障，与上面的mb()/wmb()/rmb()基本相同
+// 虽然内核对后者使用dsb，但无论如何，如果上面的mb()/wmb()/rmb()发生变化，确保下面的smp_*()不变
 #define smp_mb() asm volatile("dmb ish" ::: "memory")
 #define smp_wmb() asm volatile("dmb ishst" ::: "memory")
 #define smp_rmb() asm volatile("dmb ishld" ::: "memory")
 
+// 原子存储释放操作，确保存储操作在释放语义下可见
 #define smp_store_release(p, v)                                                         \
     do {                                                                                \
         union                                                                           \
@@ -44,6 +46,7 @@
         }                                                                               \
     } while (0)
 
+// 原子加载获取操作，确保加载操作在获取语义下完成
 #define smp_load_acquire(p)                                                             \
     ({                                                                                  \
         union                                                                           \

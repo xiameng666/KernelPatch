@@ -1,3 +1,4 @@
+// ARM64缓存操作汇编实现
 #define ASM_NL	;
 
 #define ALIGN	.align 4,0x90
@@ -16,214 +17,184 @@
 	.quad	9999b,l;			\
 	.previous
 
+// 函数入口点宏定义
 #define ENTRY(name) \
 	.globl name ASM_NL \
 	ALIGN ASM_NL \
 	name:
 
+// 函数结束标记宏定义
 #define END(name) \
 	.size name, .-name
 
+// 过程结束标记宏定义
 #define ENDPROC(name) \
 	.type name, @function ASM_NL \
 	END(name)
 
-/*
- * dcache_line_size - get the minimum D-cache line size from the CTR register.
- */
+// 从CTR寄存器获取最小D-cache行大小的宏
 	.macro	dcache_line_size, reg, tmp
-	mrs	\tmp, ctr_el0			// read CTR
-	ubfm	\tmp, \tmp, #16, #19		// cache line size encoding
-	mov	\reg, #4			// bytes per word
-	lsl	\reg, \reg, \tmp		// actual cache line size
+	mrs	\tmp, ctr_el0			// 读取CTR寄存器
+	ubfm	\tmp, \tmp, #16, #19		// 提取缓存行大小编码
+	mov	\reg, #4			// 每字4字节
+	lsl	\reg, \reg, \tmp		// 计算实际缓存行大小
 	.endm
 
-/*
- * icache_line_size - get the minimum I-cache line size from the CTR register.
- */
+// 从CTR寄存器获取最小I-cache行大小的宏
 	.macro	icache_line_size, reg, tmp
-	mrs	\tmp, ctr_el0			// read CTR
-	and	\tmp, \tmp, #0xf		// cache line size encoding
-	mov	\reg, #4			// bytes per word
-	lsl	\reg, \reg, \tmp		// actual cache line size
+	mrs	\tmp, ctr_el0			// 读取CTR寄存器
+	and	\tmp, \tmp, #0xf		// 提取缓存行大小编码
+	mov	\reg, #4			// 每字4字节
+	lsl	\reg, \reg, \tmp		// 计算实际缓存行大小
 	.endm
 
-/*
- *	__flush_dcache_all()
- *
- *	Flush the whole D-cache.
- *
- *	Corrupted registers: x0-x7, x9-x11
- */
+// 刷新整个D-cache
+// 损坏的寄存器：x0-x7, x9-x11
 ENTRY(__flush_dcache_all)
-	dmb	sy				// ensure ordering with previous memory accesses
-	mrs	x0, clidr_el1			// read clidr
-	and	x3, x0, #0x7000000		// extract loc from clidr
-	lsr	x3, x3, #23			// left align loc bit field
-	cbz	x3, finished			// if loc is 0, then no need to clean
-	mov	x10, #0				// start clean at cache level 0
+	dmb	sy				// 确保与先前内存访问的顺序
+	mrs	x0, clidr_el1			// 读取clidr寄存器
+	and	x3, x0, #0x7000000		// 从clidr提取loc字段
+	lsr	x3, x3, #23			// 左对齐loc位字段
+	cbz	x3, finished			// 如果loc为0，则无需清理
+	mov	x10, #0				// 从缓存级别0开始清理
 loop1:
-	add	x2, x10, x10, lsr #1		// work out 3x current cache level
-	lsr	x1, x0, x2			// extract cache type bits from clidr
-	and	x1, x1, #7			// mask of the bits for current cache only
-	cmp	x1, #2				// see what cache we have at this level
-	b.lt	skip				// skip if no cache, or just i-cache
+	add	x2, x10, x10, lsr #1		// 计算3倍当前缓存级别
+	lsr	x1, x0, x2			// 从clidr提取缓存类型位
+	and	x1, x1, #7			// 仅保留当前缓存的类型位
+	cmp	x1, #2				// 查看此级别的缓存类型
+	b.lt	skip				// 如果无缓存或仅i-cache则跳过
 	# todo:
-	# save_and_disable_irqs x9		// make CSSELR and CCSIDR access atomic
-	msr	csselr_el1, x10			// select current cache level in csselr
-	isb					// isb to sych the new cssr&csidr
-	mrs	x1, ccsidr_el1			// read the new ccsidr
+	# save_and_disable_irqs x9		// 使CSSELR和CCSIDR访问原子化
+	msr	csselr_el1, x10			// 在csselr中选择当前缓存级别
+	isb					// isb同步新的cssr&csidr
+	mrs	x1, ccsidr_el1			// 读取新的ccsidr
 	# todo
 	# restore_irqs x9
-	and	x2, x1, #7			// extract the length of the cache lines
-	add	x2, x2, #4			// add 4 (line length offset)
+	and	x2, x1, #7			// 提取缓存行长度
+	add	x2, x2, #4			// 添加4（行长度偏移）
 	mov	x4, #0x3ff
-	and	x4, x4, x1, lsr #3		// find maximum number on the way size
-	clz	w5, w4				// find bit position of way size increment
+	and	x4, x4, x1, lsr #3		// 找到way大小的最大值
+	clz	w5, w4				// 找到way大小增量的位位置
 	mov	x7, #0x7fff
-	and	x7, x7, x1, lsr #13		// extract max number of the index size
+	and	x7, x7, x1, lsr #13		// 提取索引大小的最大值
 loop2:
-	mov	x9, x4				// create working copy of max way size
+	mov	x9, x4				// 创建最大way大小的工作副本
 loop3:
 	lsl	x6, x9, x5
-	orr	x11, x10, x6			// factor way and cache number into x11
+	orr	x11, x10, x6			// 将way和缓存编号因子化到x11
 	lsl	x6, x7, x2
-	orr	x11, x11, x6			// factor index number into x11
-	dc	cisw, x11			// clean & invalidate by set/way
-	subs	x9, x9, #1			// decrement the way
+	orr	x11, x11, x6			// 将索引编号因子化到x11
+	dc	cisw, x11			// 通过set/way清理和无效化
+	subs	x9, x9, #1			// 递减way
 	b.ge	loop3
-	subs	x7, x7, #1			// decrement the index
+	subs	x7, x7, #1			// 递减索引
 	b.ge	loop2
 skip:
-	add	x10, x10, #2			// increment cache number
+	add	x10, x10, #2			// 增加缓存编号
 	cmp	x3, x10
 	b.gt	loop1
 finished:
-	mov	x10, #0				// swith back to cache level 0
-	msr	csselr_el1, x10			// select current cache level in csselr
+	mov	x10, #0				// 切换回缓存级别0
+	msr	csselr_el1, x10			// 在csselr中选择当前缓存级别
 	dsb	sy
 	isb
 	ret
 ENDPROC(__flush_dcache_all)
 
-/*
- *	flush_cache_all()
- *
- *	Flush the entire cache system.  The data cache flush is now achieved
- *	using atomic clean / invalidates working outwards from L1 cache. This
- *	is done using Set/Way based cache maintainance instructions.  The
- *	instruction cache can still be invalidated back to the point of
- *	unification in a single instruction.
- */
+// 刷新整个缓存系统
+// 现在使用从L1缓存向外工作的原子清理/无效化来实现数据缓存刷新
+// 这是通过基于Set/Way的缓存维护指令完成的
+// 指令缓存仍然可以通过单个指令无效化到统一点
 ENTRY(flush_cache_all)
-	mov	x12, lr
-	bl	__flush_dcache_all
+	mov	x12, lr          // 保存链接寄存器
+	bl	__flush_dcache_all    // 调用D-cache刷新函数
 	mov	x0, #0
-	ic	ialluis				// I+BTB cache invalidate
-	ret	x12
+	ic	ialluis          // I+BTB缓存无效化
+	ret	x12              // 返回
 ENDPROC(flush_cache_all)
 
-/*
- *	flush_icache_range(start,end)
- *
- *	Ensure that the I and D caches are coherent within specified region.
- *	This is typically used when code has been written to a memory region,
- *	and will be executed.
- *
- *	- start   - virtual start address of region
- *	- end     - virtual end address of region
- */
+// 刷新指定范围的指令缓存
+// 确保指定区域内的I和D缓存一致
+// 通常在代码写入内存区域后使用，即将执行时调用
+// start - 区域的虚拟起始地址
+// end   - 区域的虚拟结束地址
 ENTRY(flush_icache_range)
 	/* FALLTHROUGH */
 
-/*
- *	__flush_cache_user_range(start,end)
- *
- *	Ensure that the I and D caches are coherent within specified region.
- *	This is typically used when code has been written to a memory region,
- *	and will be executed.
- *
- *	- start   - virtual start address of region
- *	- end     - virtual end address of region
- */
+// 刷新用户范围的缓存
+// 确保指定区域内的I和D缓存一致
+// 通常在代码写入内存区域后使用，即将执行时调用
+// start - 区域的虚拟起始地址
+// end   - 区域的虚拟结束地址
 ENTRY(__flush_cache_user_range)
-	dcache_line_size x2, x3
-	sub	x3, x2, #1
-	bic	x4, x0, x3
+	dcache_line_size x2, x3      // 获取D-cache行大小
+	sub	x3, x2, #1               // 计算对齐掩码
+	bic	x4, x0, x3               // 对齐起始地址
 1:
-USER(9f, dc	cvau, x4	)		// clean D line to PoU
-	add	x4, x4, x2
-	cmp	x4, x1
-	b.lo	1b
-	dsb	ish
+USER(9f, dc	cvau, x4	)		// 清理D行到PoU（统一点）
+	add	x4, x4, x2               // 移动到下一个缓存行
+	cmp	x4, x1                   // 检查是否到达结束地址
+	b.lo	1b                   // 循环直到完成
+	dsb	ish                      // 数据同步屏障
 
-	icache_line_size x2, x3
-	sub	x3, x2, #1
-	bic	x4, x0, x3
+	icache_line_size x2, x3      // 获取I-cache行大小
+	sub	x3, x2, #1               // 计算对齐掩码
+	bic	x4, x0, x3               // 对齐起始地址
 1:
-USER(9f, ic	ivau, x4	)		// invalidate I line PoU
-	add	x4, x4, x2
-	cmp	x4, x1
-	b.lo	1b
-9:						// ignore any faulting cache operation
-	dsb	ish
-	isb
+USER(9f, ic	ivau, x4	)		// 无效化I行PoU
+	add	x4, x4, x2               // 移动到下一个缓存行
+	cmp	x4, x1                   // 检查是否到达结束地址
+	b.lo	1b                   // 循环直到完成
+9:						// 忽略任何缓存操作错误
+	dsb	ish                      // 数据同步屏障
+	isb                          // 指令同步屏障
 	ret
 ENDPROC(flush_icache_range)
 ENDPROC(__flush_cache_user_range)
 
-/*
- *	__flush_dcache_area(kaddr, size)
- *
- *	Ensure that the data held in the page kaddr is written back to the
- *	page in question.
- *
- *	- kaddr   - kernel address
- *	- size    - size in question
- */
+// 刷新D-cache区域
+// 确保页面kaddr中保存的数据写回到相应页面
+// kaddr - 内核地址
+// size  - 问题区域的大小
 ENTRY(__flush_dcache_area)
-	dcache_line_size x2, x3
-	add	x1, x0, x1
-	sub	x3, x2, #1
-	bic	x0, x0, x3
-1:	dc	civac, x0			// clean & invalidate D line / unified line
-	add	x0, x0, x2
-	cmp	x0, x1
-	b.lo	1b
-	dsb	sy
+	dcache_line_size x2, x3      // 获取D-cache行大小
+	add	x1, x0, x1               // 计算结束地址
+	sub	x3, x2, #1               // 计算对齐掩码
+	bic	x0, x0, x3               // 对齐起始地址
+1:	dc	civac, x0			// 清理并无效化D行/统一行
+	add	x0, x0, x2               // 移动到下一个缓存行
+	cmp	x0, x1                   // 检查是否到达结束地址
+	b.lo	1b                   // 循环直到完成
+	dsb	sy                       // 系统数据同步屏障
 	ret
 ENDPROC(__flush_dcache_area)
 
-/*
- *	__inval_cache_range(start, end)
- *	- start   - start address of region
- *	- end     - end address of region
- */
+// 无效化缓存范围
+// start - 区域起始地址
+// end   - 区域结束地址
 ENTRY(__inval_cache_range)
 	/* FALLTHROUGH */
 
-/*
- *	__dma_inv_range(start, end)
- *	- start   - virtual start address of region
- *	- end     - virtual end address of region
- */
+// DMA无效化范围
+// start - 区域的虚拟起始地址
+// end   - 区域的虚拟结束地址
 __dma_inv_range:
-	dcache_line_size x2, x3
-	sub	x3, x2, #1
-	tst	x1, x3				// end cache line aligned?
-	bic	x1, x1, x3
-	b.eq	1f
-	dc	civac, x1			// clean & invalidate D / U line
-1:	tst	x0, x3				// start cache line aligned?
-	bic	x0, x0, x3
-	b.eq	2f
-	dc	civac, x0			// clean & invalidate D / U line
-	b	3f
-2:	dc	ivac, x0			// invalidate D / U line
-3:	add	x0, x0, x2
-	cmp	x0, x1
-	b.lo	2b
-	dsb	sy
+	dcache_line_size x2, x3      // 获取D-cache行大小
+	sub	x3, x2, #1               // 计算对齐掩码
+	tst	x1, x3			// 结束地址是否缓存行对齐？
+	bic	x1, x1, x3               // 对齐结束地址
+	b.eq	1f                   // 如果对齐则跳转
+	dc	civac, x1			// 清理并无效化D/U行
+1:	tst	x0, x3			// 起始地址是否缓存行对齐？
+	bic	x0, x0, x3               // 对齐起始地址
+	b.eq	2f                   // 如果对齐则跳转
+	dc	civac, x0			// 清理并无效化D/U行
+	b	3f                       // 跳转到循环
+2:	dc	ivac, x0			// 无效化D/U行
+3:	add	x0, x0, x2           // 移动到下一个缓存行
+	cmp	x0, x1                   // 检查是否到达结束地址
+	b.lo	2b                   // 循环直到完成
+	dsb	sy                       // 系统数据同步屏障
 	ret
 ENDPROC(__inval_cache_range)
 ENDPROC(__dma_inv_range)
@@ -246,45 +217,39 @@ __dma_clean_range:
 	ret
 ENDPROC(__dma_clean_range)
 
-/*
- *	__dma_flush_range(start, end)
- *	- start   - virtual start address of region
- *	- end     - virtual end address of region
- */
+// DMA刷新范围（清理并无效化）
+// start - 区域的虚拟起始地址
+// end   - 区域的虚拟结束地址
 ENTRY(__dma_flush_range)
-	dcache_line_size x2, x3
-	sub	x3, x2, #1
-	bic	x0, x0, x3
-1:	dc	civac, x0			// clean & invalidate D / U line
-	add	x0, x0, x2
-	cmp	x0, x1
-	b.lo	1b
-	dsb	sy
+	dcache_line_size x2, x3      // 获取D-cache行大小
+	sub	x3, x2, #1               // 计算对齐掩码
+	bic	x0, x0, x3               // 对齐起始地址到缓存行边界
+1:	dc	civac, x0		     // 清理并无效化D/U行
+	add	x0, x0, x2               // 移动到下一个缓存行
+	cmp	x0, x1                   // 检查是否到达结束地址
+	b.lo	1b                   // 循环直到完成
+	dsb	sy                       // 系统数据同步屏障
 	ret
 ENDPROC(__dma_flush_range)
 
-/*
- *	__dma_map_area(start, size, dir)
- *	- start	- kernel virtual start address
- *	- size	- size of region
- *	- dir	- DMA direction
- */
+// DMA映射区域
+// start - 内核虚拟起始地址
+// size  - 区域大小
+// dir   - DMA方向
 ENTRY(__dma_map_area)
-	add	x1, x1, x0
-	cmp	w2, #DMA_FROM_DEVICE
-	b.eq	__dma_inv_range
-	b	__dma_clean_range
+	add	x1, x1, x0               // 计算结束地址
+	cmp	w2, #DMA_FROM_DEVICE     // 检查DMA方向是否为设备到内存
+	b.eq	__dma_inv_range      // 如果是则无效化范围
+	b	__dma_clean_range        // 否则清理范围
 ENDPROC(__dma_map_area)
 
-/*
- *	__dma_unmap_area(start, size, dir)
- *	- start	- kernel virtual start address
- *	- size	- size of region
- *	- dir	- DMA direction
- */
+// DMA取消映射区域
+// start - 内核虚拟起始地址
+// size  - 区域大小
+// dir   - DMA方向
 ENTRY(__dma_unmap_area)
-	add	x1, x1, x0
-	cmp	w2, #DMA_TO_DEVICE
-	b.ne	__dma_inv_range
-	ret
+	add	x1, x1, x0               // 计算结束地址
+	cmp	w2, #DMA_TO_DEVICE       // 检查DMA方向是否为内存到设备
+	b.ne	__dma_inv_range      // 如果不是则无效化范围
+	ret                          // 否则直接返回
 ENDPROC(__dma_unmap_area)

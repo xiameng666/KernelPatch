@@ -1,10 +1,13 @@
+// 系统调用名称映射表 - 提供系统调用号到名称的映射关系
 #include <symbol.h>
 #include <stdint.h>
 
+// 64位系统调用名称映射表结构
+// 包含系统调用名称和地址的映射关系
 struct
 {
-    const char *name;
-    uintptr_t addr;
+    const char *name;  // 系统调用名称
+    uintptr_t addr;    // 系统调用地址（初始化为0）
 } syscall_name_table[460] = {
     [0] = { "sys_io_setup", 0 },
     [1] = { "sys_io_destroy", 0 },
@@ -312,12 +315,15 @@ struct
     [450] = { "sys_set_mempolicy_home_node", 0 },
     [451] = { "sys_cachestat", 0 },
 };
+// 导出64位系统调用名称表符号供其他模块使用
 KP_EXPORT_SYMBOL(syscall_name_table);
 
+// 32位兼容系统调用名称映射表结构
+// 用于处理32位应用程序在64位系统上的系统调用
 struct
 {
-    const char *name;
-    uintptr_t addr;
+    const char *name;  // 兼容系统调用名称
+    uintptr_t addr;    // 兼容系统调用地址（初始化为0）
 } compat_syscall_name_table[460] = {
     [0] = { "sys_restart_syscall", 0 },
     [1] = { "sys_exit", 0 },
@@ -718,4 +724,5 @@ struct
     [450] = { "sys_set_mempolicy_home_node", 0 },
     [451] = { "sys_cachestat", 0 },
 };
+// 导出32位兼容系统调用名称表符号供其他模块使用
 KP_EXPORT_SYMBOL(compat_syscall_name_table);
