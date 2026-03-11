@@ -412,16 +412,31 @@ static int wxjump_auto_cleanup(void *mm, struct wx_region *region,
     wx_spin_lock();
     if (pi->shadow_page_va) {
         uint64_t shadow_va = pi->shadow_page_va;
+        uint64_t saved_orig_pte = pi->orig_pte;
         pi->shadow_page_va = 0;
         pi->state = STATE_NONE;
         pi->orig_pfn = 0;
+        pi->orig_pte = 0;
         pi->shadow_pfn = 0;
         pi->patch_count = 0;
         wx_spin_unlock();
+
+        /* 先恢复原始 PTE 再释放 shadow page，避免悬垂 PTE 指向已释放页 */
+        if (saved_orig_pte && mm) {
+            uint64_t *pte = get_user_pte(mm, addr, NULL);
+            if (pte && (*pte & 1)) {
+                *pte = saved_orig_pte;
+                void *vma = kfn_find_vma(mm, addr);
+                wxjump_flush_tlb_page(
+                    (vma && addr >= *(unsigned long *)vma) ? vma : NULL, addr);
+            }
+        }
+
         kfn_free_pages(shadow_va, 0);
     } else {
         pi->state = STATE_NONE;
         pi->orig_pfn = 0;
+        pi->orig_pte = 0;
         pi->shadow_pfn = 0;
         pi->patch_count = 0;
         wx_spin_unlock();
@@ -915,6 +930,7 @@ static int wxjump_do_release(void *mm, unsigned long page_addr,
         void *vma = kfn_find_vma(mm, page_addr);
         if (vma && page_addr >= *(unsigned long *)vma && pi->state != STATE_NONE) {
             uint64_t shadow_va = pi->shadow_page_va;
+            int pte_restored = 0;
 
             /* 精确恢复原始 PTE (保留 PXN 等所有原始标志) */
             {
@@ -925,21 +941,28 @@ static int wxjump_do_release(void *mm, unsigned long page_addr,
                 if (release_pte) {
                     *release_pte = pi->orig_pte;
                     wxjump_flush_tlb_page(vma, page_addr);
+                    pte_restored = 1;
+                } else {
+                    pr_warn("wxjump: release: PTE lookup failed for %lx, keeping shadow\n", page_addr);
                 }
             }
-            wx_flush_icache(page_addr);  /* 清除 shadow 指令的 I-cache 残留 */
 
-            wx_spin_lock();
-            pi->shadow_page_va = 0;
-            pi->orig_pfn = 0;
-            pi->orig_pte = 0;
-            pi->shadow_pfn = 0;
-            pi->state = STATE_NONE;
-            wx_spin_unlock();
+            /* 仅在 PTE 成功恢复后才释放 shadow page，避免悬垂映射 */
+            if (pte_restored) {
+                wx_flush_icache(page_addr);
 
-            if (shadow_va)
-                kfn_free_pages(shadow_va, 0);
-            pr_info("wxjump: shadow page freed for %lx\n", page_addr);
+                wx_spin_lock();
+                pi->shadow_page_va = 0;
+                pi->orig_pfn = 0;
+                pi->orig_pte = 0;
+                pi->shadow_pfn = 0;
+                pi->state = STATE_NONE;
+                wx_spin_unlock();
+
+                if (shadow_va)
+                    kfn_free_pages(shadow_va, 0);
+                pr_info("wxjump: shadow page freed for %lx\n", page_addr);
+            }
         }
     } else if (pi->state == STATE_SHADOW_X) {
         /* 还有其他 patch，刷新 icache 使恢复的字节生效 */
@@ -1006,57 +1029,63 @@ static void exit_mmap_before(hook_fargs1_t *fargs, void *udata)
     void *mm = (void *)fargs->arg0;
     struct wx_region *regions[32];
     struct wx_region *r, *tmp;
-    int count = 0;
+    int count, total = 0;
     int i, j;
 
     if (!mm)
         return;
 
-    wx_spin_lock();
-    list_for_each_entry_safe(r, tmp, &region_list, list) {
-        if (r->mm == mm && count < 32) {
-            list_del_init(&r->list);
-            regions[count++] = r;
-        }
-    }
-    wx_spin_unlock();
-
-    if (!count)
-        return;
-
-    pr_info("wxjump: [exit_mmap] mm=%px, restoring %d regions\n", mm, count);
-
-    for (i = 0; i < count; i++) {
-        r = regions[i];
-        int nr = r->nr_pages;
-        struct page_info *pages = r->pages;
-
-        if (nr > 0 && pages) {
-            for (j = 0; j < nr; j++) {
-                struct page_info *pi = &pages[j];
-                if (!pi->shadow_pfn || !pi->orig_pfn)
-                    continue;
-
-                unsigned long addr = r->vm_start + ((unsigned long)j << 12);
-                uint64_t shadow_va = pi->shadow_page_va;
-
-                void *vma = kfn_find_vma(mm, addr);
-                if (vma && addr >= *(unsigned long *)vma) {
-                    uint64_t *pte = get_user_pte(mm, addr, NULL);
-                    if (pte && (*pte & 1) && pi->orig_pte) {
-                        *pte = pi->orig_pte;
-                        wxjump_flush_tlb_page(vma, addr);
-                    }
-                }
-                if (shadow_va)
-                    kfn_free_pages(shadow_va, 0);
+    /* 循环收集，每轮最多 32 个，直到该 mm 的所有 region 全部处理 */
+    for (;;) {
+        count = 0;
+        wx_spin_lock();
+        list_for_each_entry_safe(r, tmp, &region_list, list) {
+            if (r->mm == mm && count < 32) {
+                list_del_init(&r->list);
+                regions[count++] = r;
             }
         }
+        wx_spin_unlock();
 
-        if (pages)
-            kfn_kfree(pages);
-        kfn_kfree(r);
+        if (!count)
+            break;
+        total += count;
+
+        for (i = 0; i < count; i++) {
+            r = regions[i];
+            int nr = r->nr_pages;
+            struct page_info *pages = r->pages;
+
+            if (nr > 0 && pages) {
+                for (j = 0; j < nr; j++) {
+                    struct page_info *pi = &pages[j];
+                    if (!pi->shadow_pfn || !pi->orig_pfn)
+                        continue;
+
+                    unsigned long addr = r->vm_start + ((unsigned long)j << 12);
+                    uint64_t shadow_va = pi->shadow_page_va;
+
+                    void *vma = kfn_find_vma(mm, addr);
+                    if (vma && addr >= *(unsigned long *)vma) {
+                        uint64_t *pte = get_user_pte(mm, addr, NULL);
+                        if (pte && (*pte & 1) && pi->orig_pte) {
+                            *pte = pi->orig_pte;
+                            wxjump_flush_tlb_page(vma, addr);
+                        }
+                    }
+                    if (shadow_va)
+                        kfn_free_pages(shadow_va, 0);
+                }
+            }
+
+            if (pages)
+                kfn_kfree(pages);
+            kfn_kfree(r);
+        }
     }
+
+    if (total)
+        pr_info("wxjump: [exit_mmap] mm=%px, cleaned %d regions\n", mm, total);
 }
 
 /* ========== 符号解析 ========== */
