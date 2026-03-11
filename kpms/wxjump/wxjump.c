@@ -116,6 +116,10 @@ static void *(*kfn_kcalloc)(unsigned long n, unsigned long size, unsigned int fl
 static void  (*kfn_kfree)(void *ptr);
 static int   (*kfn_copy_from_kernel_nofault)(void *dst, const void *src, unsigned long size);
 
+static int   (*kfn_down_read_trylock)(void *sem);
+static void  (*kfn_down_read)(void *sem);
+static void  (*kfn_up_read)(void *sem);
+
 static void *kfn_do_page_fault;
 
 /* 地址转换 */
@@ -130,6 +134,7 @@ static int      wx_mm_context_id_offset = -1;
 static int      wx_mm_context_id_asid_shift = 0;
 static int16_t  wx_vma_vm_mm_offset = 64;
 static unsigned int wx_gfp_kernel = WX_GFP_KERNEL;
+static int wx_mmap_lock_offset = -1;
 
 /* 全局状态 */
 static LIST_HEAD(region_list);
@@ -138,6 +143,7 @@ static LIST_HEAD(region_list);
 static unsigned long wx_fault_read_count;
 static unsigned long wx_fault_exec_count;
 static unsigned long wx_fault_el1_skip_count;
+static unsigned long wx_fault_total_count;  /* 所有进入 handler 的 fault */
 static uint64_t global_lock;
 
 /* ========== PA ↔ VA 转换 ========== */
@@ -172,6 +178,39 @@ static inline void wx_spin_unlock(void)
 {
     if (kfn__raw_spin_unlock)
         kfn__raw_spin_unlock(&global_lock);
+}
+
+/* ========== mmap_lock (rw_semaphore) ========== */
+
+static inline void *wx_mmap_lock_ptr(void *mm)
+{
+    if (wx_mmap_lock_offset < 0)
+        return NULL;
+    return (void *)((uint64_t)mm + wx_mmap_lock_offset);
+}
+
+static inline int wx_mmap_read_trylock(void *mm)
+{
+    void *sem = wx_mmap_lock_ptr(mm);
+    if (!sem || !kfn_down_read_trylock)
+        return 1;  /* no lock available — proceed without */
+    return kfn_down_read_trylock(sem);
+}
+
+static inline void wx_mmap_read_lock(void *mm)
+{
+    void *sem = wx_mmap_lock_ptr(mm);
+    if (!sem || !kfn_down_read)
+        return;
+    kfn_down_read(sem);
+}
+
+static inline void wx_mmap_read_unlock(void *mm)
+{
+    void *sem = wx_mmap_lock_ptr(mm);
+    if (!sem || !kfn_up_read)
+        return;
+    kfn_up_read(sem);
 }
 
 /* ========== 缓存/TLB ========== */
@@ -613,12 +652,18 @@ static void do_page_fault_before(hook_fargs3_t *fargs, void *udata)
     unsigned long esr = fargs->arg1;    /* x1: ESR_EL1 */
     void *task = (void *)get_current();
     void *mm;
+    unsigned long cnt;
+
+    cnt = ++wx_fault_total_count;
+    /* 前 5 次 fault 打印完整诊断 */
+    if (cnt <= 5)
+        pr_info("wxjump: fault #%lu FAR=%lx ESR=%lx task=%px\n", cnt, far, esr, task);
 
     mm = kfn_get_task_mm(task);
     if (!mm)
         return;
 
-    /* 只处理 permission fault (AP 拒绝数据访问 / UXN 拒绝执行) */
+    /* 只处理 permission fault (DFSC[5:2]=0b0011) */
     if ((esr & 0x3C) != 0x0C) {
         kfn_mmput(mm);
         return;
@@ -634,11 +679,22 @@ static void do_page_fault_before(hook_fargs3_t *fargs, void *udata)
     unsigned long ec = (esr >> 26) & 0x3FUL;
     unsigned long dfsc = esr & 0x3FUL;
 
+    if (cnt <= 5)
+        pr_info("wxjump: fault #%lu EC=0x%lx DFSC=0x%lx matched_region FAR=%lx\n",
+                cnt, ec, dfsc, far);
 
     /* Only handle EL0 faults. EL1 faults (EC=0x21/0x25) are from kernel
      * (e.g. EPAN blocking EL1 access to UXN=0 pages) -> let kernel handle */
     if (ec != 0x24 && ec != 0x20) {
         wx_fault_el1_skip_count++;
+        kfn_mmput(mm);
+        return;
+    }
+
+    /* Acquire mmap_lock before VMA tree traversal in handlers.
+     * Use trylock: we are in fault context (before kernel's do_page_fault
+     * acquires its own lock). If contended, skip and let kernel handle. */
+    if (!wx_mmap_read_trylock(mm)) {
         kfn_mmput(mm);
         return;
     }
@@ -660,6 +716,7 @@ static void do_page_fault_before(hook_fargs3_t *fargs, void *udata)
         wxjump_handle_write_fault(mm, far);
     }
 
+    wx_mmap_read_unlock(mm);
     kfn_mmput(mm);
 }
 
@@ -1009,7 +1066,9 @@ static void prctl_before(hook_fargs5_t *fargs, void *udata)
             return;
         }
 
+        wx_mmap_read_lock(mm);
         ret = wxjump_do_patch(mm, page_addr, user_buf, len, offset);
+        wx_mmap_read_unlock(mm);
         kfn_mmput(mm);
         fargs->skip_origin = 1;
         fargs->ret = ret;
@@ -1028,7 +1087,9 @@ static void prctl_before(hook_fargs5_t *fargs, void *udata)
             return;
         }
 
+        wx_mmap_read_lock(mm);
         ret = wxjump_do_release(mm, page_addr, len, offset);
+        wx_mmap_read_unlock(mm);
         kfn_mmput(mm);
         fargs->skip_origin = 1;
         fargs->ret = ret;
@@ -1113,12 +1174,15 @@ static void exit_mmap_before(hook_fargs1_t *fargs, void *udata)
 
 static int resolve_symbols(void)
 {
-    pr_info("wxjump: resolving symbols...\n");
+    pr_info("wxjump: ====== resolve_symbols START ======\n");
 
     /* MM */
     RESOLVE_REQUIRED("find_vma", kfn_find_vma);
+    pr_info("wxjump:   find_vma         = %px\n", kfn_find_vma);
     RESOLVE_REQUIRED("get_task_mm", kfn_get_task_mm);
+    pr_info("wxjump:   get_task_mm      = %px\n", kfn_get_task_mm);
     RESOLVE_REQUIRED("mmput", kfn_mmput);
+    pr_info("wxjump:   mmput            = %px\n", kfn_mmput);
 
     kfn_exit_mmap = (void *)kallsyms_lookup_name("exit_mmap");
     if (kfn_exit_mmap)
@@ -1129,6 +1193,8 @@ static int resolve_symbols(void)
     /* Page alloc/free */
     RESOLVE_REQUIRED("__get_free_pages", kfn___get_free_pages);
     RESOLVE_REQUIRED("free_pages", kfn_free_pages);
+    pr_info("wxjump:   __get_free_pages = %px\n", kfn___get_free_pages);
+    pr_info("wxjump:   free_pages       = %px\n", kfn_free_pages);
 
     /* Address translation */
     kvar_memstart_addr = (uint64_t *)kallsyms_lookup_name("memstart_addr");
@@ -1138,27 +1204,35 @@ static int resolve_symbols(void)
     }
 
     kvar_physvirt_offset = (uint64_t *)kallsyms_lookup_name("physvirt_offset");
+    pr_info("wxjump:   memstart_addr    = %px (val=0x%llx)\n", kvar_memstart_addr, *kvar_memstart_addr);
+    pr_info("wxjump:   physvirt_offset  = %px\n", kvar_physvirt_offset);
 
     uint64_t tcr = 0;
     asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
     int t1sz = (tcr >> 16) & 0x3F;
     wx_page_offset_base = -1ULL << (64 - t1sz);
+    pr_info("wxjump:   TCR_EL1=0x%llx T1SZ=%d PAGE_OFFSET=0x%llx\n", tcr, t1sz, wx_page_offset_base);
 
     /* physvirt_offset 检测 */
     unsigned long test_page = kfn___get_free_pages(wx_gfp_kernel, 0);
+    pr_info("wxjump:   test_page alloc  = 0x%lx\n", test_page);
     if (test_page) {
         uint64_t par;
         asm volatile("at s1e1r, %0" :: "r"(test_page));
         isb();
         asm volatile("mrs %0, par_el1" : "=r"(par));
+        pr_info("wxjump:   PAR_EL1=0x%llx (fault=%d)\n", par, (int)(par & 1));
         if (!(par & 1)) {
             uint64_t pa = (par & PA_MASK) | (test_page & 0xFFF);
             if (pa) {
                 detected_physvirt_offset = test_page - pa;
                 physvirt_offset_valid = 1;
+                pr_info("wxjump:   physvirt_offset  = 0x%llx (detected)\n", detected_physvirt_offset);
             }
         }
         kfn_free_pages(test_page, 0);
+    } else {
+        pr_err("wxjump:   test_page alloc FAILED\n");
     }
 
     /* Page table config (TG1: bits[31:30], 内核空间页粒度) */
@@ -1177,11 +1251,15 @@ static int resolve_symbols(void)
     /* Spinlock */
     RESOLVE_REQUIRED("_raw_spin_lock", kfn__raw_spin_lock);
     RESOLVE_REQUIRED("_raw_spin_unlock", kfn__raw_spin_unlock);
+    pr_info("wxjump:   _raw_spin_lock   = %px\n", kfn__raw_spin_lock);
+    pr_info("wxjump:   _raw_spin_unlock = %px\n", kfn__raw_spin_unlock);
 
     /* TLB flush */
     kfn_flush_tlb_page = (void *)kallsyms_lookup_name("flush_tlb_page");
+    pr_info("wxjump:   flush_tlb_page   = %px\n", kfn_flush_tlb_page);
     if (!kfn_flush_tlb_page) {
         kfn___flush_tlb_range = (typeof(kfn___flush_tlb_range))kallsyms_lookup_name("__flush_tlb_range");
+        pr_info("wxjump:   __flush_tlb_range= %px\n", kfn___flush_tlb_range);
         if (!kfn___flush_tlb_range)
             pr_warn("wxjump: no TLB flush function, will use TLBI instruction\n");
     }
@@ -1214,6 +1292,13 @@ static int resolve_symbols(void)
         kfn_copy_from_kernel_nofault = (typeof(kfn_copy_from_kernel_nofault))
             kallsyms_lookup_name("probe_kernel_read");
 
+    /* mmap_lock (rw_semaphore) operations */
+    RESOLVE_OPTIONAL("down_read_trylock", kfn_down_read_trylock);
+    RESOLVE_OPTIONAL("down_read", kfn_down_read);
+    RESOLVE_OPTIONAL("up_read", kfn_up_read);
+    pr_info("wxjump:   down_read_trylock= %px\n", kfn_down_read_trylock);
+    pr_info("wxjump:   up_read          = %px\n", kfn_up_read);
+
     /* Page fault handler */
     kfn_do_page_fault = (void *)kallsyms_lookup_name("do_page_fault");
     if (!kfn_do_page_fault)
@@ -1225,7 +1310,12 @@ static int resolve_symbols(void)
     else
         pr_warn("wxjump: page fault handler not found, CRC hiding disabled\n");
 
-    pr_info("wxjump: symbols resolved\n");
+    pr_info("wxjump:   kzalloc          = %px\n", kfn_kzalloc);
+    pr_info("wxjump:   kcalloc          = %px\n", kfn_kcalloc);
+    pr_info("wxjump:   kfree            = %px\n", kfn_kfree);
+    pr_info("wxjump:   icache_range     = %px\n", kfn___flush_icache_range);
+    pr_info("wxjump:   copy_nofault     = %px\n", kfn_copy_from_kernel_nofault);
+    pr_info("wxjump: ====== resolve_symbols OK ======\n");
     return 0;
 }
 
@@ -1332,6 +1422,51 @@ static int try_scan_context_id(void)
     return -1;
 }
 
+/* ========== mmap_lock 偏移检测 ========== */
+
+static void detect_mmap_lock(void)
+{
+    /* GKI mmap_lock offsets (validated against xiaojia-hide) */
+    if (kver >= VERSION(6, 6, 0))
+        wx_mmap_lock_offset = 96;
+    else if (kver >= VERSION(6, 1, 0))
+        wx_mmap_lock_offset = 96;
+    else if (kver >= VERSION(5, 15, 0))
+        wx_mmap_lock_offset = 104;
+    else if (kver >= VERSION(5, 10, 0))
+        wx_mmap_lock_offset = 112;
+    else if (kver >= VERSION(5, 4, 0))
+        wx_mmap_lock_offset = 112;
+    else if (kver >= VERSION(4, 19, 0))
+        wx_mmap_lock_offset = 104;
+    else {
+        wx_mmap_lock_offset = -1;
+        pr_warn("wxjump: unknown kernel version for mmap_lock, disabled\n");
+        return;
+    }
+
+    /* Verify by trylock/unlock on current mm */
+    if (kfn_down_read_trylock && kfn_up_read) {
+        void *mm = kfn_get_task_mm((void *)get_current());
+        if (mm) {
+            void *sem = (void *)((uint64_t)mm + wx_mmap_lock_offset);
+            int ok = kfn_down_read_trylock(sem);
+            if (ok) {
+                kfn_up_read(sem);
+                pr_info("wxjump: mmap_lock at offset %d (verified)\n", wx_mmap_lock_offset);
+            } else {
+                pr_warn("wxjump: mmap_lock trylock failed at offset %d, disabled\n",
+                        wx_mmap_lock_offset);
+                wx_mmap_lock_offset = -1;
+            }
+            kfn_mmput(mm);
+        }
+    } else {
+        pr_warn("wxjump: down_read_trylock/up_read not found, mmap_lock disabled\n");
+        wx_mmap_lock_offset = -1;
+    }
+}
+
 /* ========== mm_offset 推断 ========== */
 
 static int detect_mm_offset(void)
@@ -1372,7 +1507,8 @@ static long wxjump_init(const char *args, const char *event, void *reserved)
 {
     int ret;
 
-    pr_info("wxjump: initializing (args: %s)\n", args ? args : "(null)");
+    pr_info("wxjump: ====== INIT START ======\n");
+    pr_info("wxjump: args=%s\n", args ? args : "(null)");
 
     INIT_LIST_HEAD(&region_list);
     global_lock = 0;
@@ -1385,15 +1521,24 @@ static long wxjump_init(const char *args, const char *event, void *reserved)
     }
 
     /* mm_struct pgd offset 检查 */
+    pr_info("wxjump: KP offsets: pgd=%d mm=%d active_mm=%d\n",
+            mm_struct_offset.pgd_offset,
+            task_struct_offset.mm_offset,
+            task_struct_offset.active_mm_offset);
     if (mm_struct_offset.pgd_offset < 0) {
         pr_err("wxjump: pgd_offset not detected by KP framework\n");
         return -1;
     }
 
     /* 偏移量扫描 */
+    pr_info("wxjump: scanning vma offsets...\n");
     scan_vma_offsets();
+    pr_info("wxjump: vma_vm_mm_offset=0x%x\n", (unsigned)wx_vma_vm_mm_offset);
     detect_mm_offset();
     try_scan_context_id();
+    pr_info("wxjump: context_id_offset=0x%x asid_shift=%d\n",
+            wx_mm_context_id_offset, wx_mm_context_id_asid_shift);
+    detect_mmap_lock();
 
     /* Hook page fault (W^X CRC 防护) */
     if (kfn_do_page_fault) {
@@ -1429,7 +1574,7 @@ static long wxjump_init(const char *args, const char *event, void *reserved)
     }
     pr_info("wxjump: hooked prctl\n");
 
-    pr_info("wxjump: module loaded successfully\n");
+    pr_info("wxjump: ====== INIT OK ======\n");
     return 0;
 }
 
@@ -1537,8 +1682,8 @@ static long wxjump_exit(void *reserved)
 static long wxjump_control(const char *args, char *__user out_msg, int outlen)
 {
     pr_info("wxjump: control: %s\n", args ? args : "(null)");
-    pr_info("wxjump: stats: read_faults=%lu exec_faults=%lu el1_skips=%lu\n",
-            wx_fault_read_count, wx_fault_exec_count, wx_fault_el1_skip_count);
+    pr_info("wxjump: stats: total=%lu read=%lu exec=%lu el1_skip=%lu\n",
+            wx_fault_total_count, wx_fault_read_count, wx_fault_exec_count, wx_fault_el1_skip_count);
     return 0;
 }
 
