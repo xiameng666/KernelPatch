@@ -104,7 +104,7 @@ static unsigned long (*kfn___get_free_pages)(unsigned int gfp, unsigned int orde
 static void  (*kfn_free_pages)(unsigned long addr, unsigned int order);
 
 static void  (*kfn___flush_icache_range)(unsigned long start, unsigned long end);
-static void  (*kfn___flush_tlb_range)
+static void  (*kfn___flush_tlb_range)(void *vma, unsigned long start, unsigned long end,
                                        unsigned long stride, int last_level, int tlb_level);
 static void *(*kfn_flush_tlb_page)(void);
 
@@ -198,6 +198,7 @@ static inline void wx_flush_icache(unsigned long addr)
 
 static void wxjump_flush_tlb_page(void *vma, unsigned long addr)
 {
+    dsb(ishst);  /* 确保 PTE 写入对 TLB walker 可见后再执行 TLBI */
     if (kfn_flush_tlb_page) {
         ((void (*)(void *, unsigned long))kfn_flush_tlb_page)(vma, addr);
         return;
@@ -687,7 +688,7 @@ static int wxjump_do_patch(void *mm, unsigned long page_addr,
     struct wx_region *region;
     struct page_info *pi;
     int idx;
-    void *vma;
+    void *vma = NULL;
     uint8_t kbuf[64]; /* 足够容纳 20 字节的 MOVZ/MOVK/BR */
 
     if (offset + len > WX_PAGE_SIZE || len > sizeof(kbuf)) {
@@ -1411,16 +1412,21 @@ static long wxjump_exit(void *reserved)
     list_for_each_entry(r, &region_list, list) {
         count++;
     }
+    wx_spin_unlock();
 
     if (!count) {
-        wx_spin_unlock();
         pr_info("wxjump: no active regions, unload complete\n");
         return 0;
     }
 
     cleanup_list = (struct wx_region **)kfn_kzalloc(
         count * sizeof(struct wx_region *), wx_gfp_kernel);
+    if (!cleanup_list) {
+        pr_err("wxjump: exit: cleanup alloc failed, leaking %d regions\n", count);
+        return -12;
+    }
 
+    wx_spin_lock();
     i = 0;
     list_for_each_entry_safe(r, tmp, &region_list, list) {
         if (i < count) {
