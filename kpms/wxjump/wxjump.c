@@ -348,8 +348,17 @@ static int wxjump_switch_mapping(void *vma, unsigned long addr,
     if (!pte)
         return -1;
 
-    *pte = make_pte(pfn, extra_flags);
-    wxjump_flush_tlb_page(vma, addr);
+    /* ARM64 Break-Before-Make (BBM):
+     * When changing the output address of a valid PTE, we MUST invalidate
+     * the old entry before writing the new one. Direct overwrite causes
+     * TLB conflict — undefined behavior per ARM ARM D5.10.1.
+     * Sequence: write invalid → TLBI+DSB → write new valid */
+    if (*pte & 1) {
+        *pte = 0;                          /* Break: invalidate old entry */
+        wxjump_flush_tlb_page(vma, addr);  /* TLBI + DSB across all cores */
+    }
+
+    *pte = make_pte(pfn, extra_flags);     /* Make: install new mapping */
     return 0;
 }
 
@@ -404,8 +413,11 @@ static void wxjump_put_region(struct wx_region *r)
 
 /* ========== 映射验证 ========== */
 
+/* P0-2 fix: accept pfn values directly instead of reading from pi after unlock.
+ * Callers snapshot orig_pfn / shadow_pfn inside spinlock, then pass the copies. */
 static int wxjump_validate_mapping(void *mm, void *vma,
-                                    struct page_info *pi, unsigned long addr)
+                                    uint64_t orig_pfn, uint64_t shadow_pfn,
+                                    unsigned long addr)
 {
     uint64_t *pte;
     uint64_t pte_val, current_pfn;
@@ -424,10 +436,9 @@ static int wxjump_validate_mapping(void *mm, void *vma,
 
     current_pfn = (pte_val >> 12) & PFN_MASK;
 
-    if (pi->shadow_pfn && pi->shadow_pfn == current_pfn)
+    if (shadow_pfn && shadow_pfn == current_pfn)
         return 1;
-    if (pi->orig_pfn && pi->orig_pfn == current_pfn &&
-        pi->state >= STATE_ORIG_R && pi->state <= STATE_SHADOW_X)
+    if (orig_pfn && orig_pfn == current_pfn)
         return 1;
 
     return 0;
@@ -548,6 +559,9 @@ static int wxjump_handle_read_fault(void *mm, unsigned long addr)
         wxjump_put_region(region);
         return -1;
     }
+    /* P0-2 fix: snapshot fields while holding lock to prevent UAF race */
+    uint64_t local_orig_pfn = pi->orig_pfn;
+    uint64_t local_shadow_pfn = pi->shadow_pfn;
     wx_spin_unlock();
 
     vma = kfn_find_vma(mm, addr);
@@ -557,7 +571,7 @@ static int wxjump_handle_read_fault(void *mm, unsigned long addr)
         return -1;
     }
 
-    if (!wxjump_validate_mapping(mm, vma, pi, page_addr)) {
+    if (!wxjump_validate_mapping(mm, vma, local_orig_pfn, local_shadow_pfn, page_addr)) {
         wxjump_auto_cleanup(mm, region, idx, "Mapping Changed (read)");
         wxjump_put_region(region);
         return -1;
@@ -565,7 +579,7 @@ static int wxjump_handle_read_fault(void *mm, unsigned long addr)
 
     /* 切到 orig page: UXN + 只读 (可读不可执行) */
     wx_fault_read_count++;
-    ret = wxjump_switch_mapping(vma, page_addr, pi->orig_pfn, PTE_UXN_USER_RO);
+    ret = wxjump_switch_mapping(vma, page_addr, local_orig_pfn, PTE_UXN_USER_RO);
     if (ret) {
         wxjump_put_region(region);
         return -1;
@@ -609,6 +623,10 @@ static int wxjump_handle_exec_fault(void *mm, unsigned long addr)
         wxjump_put_region(region);
         return -1;
     }
+    /* P0-2 fix: snapshot fields while holding lock to prevent UAF race */
+    uint64_t local_shadow_pfn = pi->shadow_pfn;
+    uint64_t local_orig_pfn = pi->orig_pfn;
+    uint64_t local_shadow_page_va = pi->shadow_page_va;
     wx_spin_unlock();
 
     vma = kfn_find_vma(mm, addr);
@@ -618,17 +636,17 @@ static int wxjump_handle_exec_fault(void *mm, unsigned long addr)
         return -1;
     }
 
-    if (!wxjump_validate_mapping(mm, vma, pi, page_addr)) {
+    if (!wxjump_validate_mapping(mm, vma, local_orig_pfn, local_shadow_pfn, page_addr)) {
         wxjump_auto_cleanup(mm, region, idx, "Mapping Changed (exec)");
         wxjump_put_region(region);
         return -1;
     }
 
-    if (pi->shadow_page_va)
-        wx_flush_dcache_va(pi->shadow_page_va, WX_PAGE_SIZE);
+    if (local_shadow_page_va)
+        wx_flush_dcache_va(local_shadow_page_va, WX_PAGE_SIZE);
 
     /* 切到 shadow page (--x, execute-only) */
-    ret = wxjump_switch_mapping(vma, page_addr, pi->shadow_pfn, 0);
+    ret = wxjump_switch_mapping(vma, page_addr, local_shadow_pfn, 0);
     if (ret) {
         wxjump_put_region(region);
         return -1;
