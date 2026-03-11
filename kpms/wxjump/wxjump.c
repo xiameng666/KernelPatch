@@ -144,7 +144,28 @@ static unsigned long wx_fault_read_count;
 static unsigned long wx_fault_exec_count;
 static unsigned long wx_fault_el1_skip_count;
 static unsigned long wx_fault_total_count;  /* 所有进入 handler 的 fault */
+static unsigned long wx_fault_reentry_count; /* 重入拦截计数 */
 static uint64_t global_lock;
+
+/* ========== Per-CPU 重入保护 ========== */
+/*
+ * 防止同一 CPU 嵌套进入 fault handler 导致 spinlock 死锁。
+ * 场景: handler 持锁期间访问内存 → 触发嵌套 fault → 再次进入 handler → 死锁。
+ * 用 MPIDR_EL1 推算 CPU 索引，无需内核符号依赖。
+ */
+#define WX_MAX_CPUS 16
+static volatile int wx_in_fault_handler[WX_MAX_CPUS];
+
+static inline int wx_cpu_id(void)
+{
+    uint64_t mpidr;
+    asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    /* Aff1 (cluster) * 4 + Aff0 (core) — 适用于 MTK DynamIQ 大小核布局 */
+    int id = (int)(((mpidr >> 8) & 0xFF) * 4 + (mpidr & 0xFF));
+    if ((unsigned)id >= WX_MAX_CPUS)
+        id &= (WX_MAX_CPUS - 1);
+    return id;
+}
 
 /* ========== PA ↔ VA 转换 ========== */
 
@@ -672,24 +693,36 @@ static void do_page_fault_before(hook_fargs3_t *fargs, void *udata)
     void *mm;
     unsigned long cnt;
 
+    /* ---- 重入保护: 同一 CPU 已在 handler 中则直接放行 ---- */
+    int cpu = wx_cpu_id();
+    if (wx_in_fault_handler[cpu]) {
+        wx_fault_reentry_count++;
+        return;  /* 交给内核默认处理 (copy_from_kernel_nofault 有 fixup) */
+    }
+    wx_in_fault_handler[cpu] = 1;
+
     cnt = ++wx_fault_total_count;
     /* 前 5 次 fault 打印完整诊断 */
     if (cnt <= 5)
         pr_info("wxjump: fault #%lu FAR=%lx ESR=%lx task=%px\n", cnt, far, esr, task);
 
     mm = kfn_get_task_mm(task);
-    if (!mm)
+    if (!mm) {
+        wx_in_fault_handler[cpu] = 0;
         return;
+    }
 
     /* 只处理 permission fault (DFSC[5:2]=0b0011) */
     if ((esr & 0x3C) != 0x0C) {
         kfn_mmput(mm);
+        wx_in_fault_handler[cpu] = 0;
         return;
     }
 
     struct wx_region *region = wxjump_find_region(mm, far);
     if (!region) {
         kfn_mmput(mm);
+        wx_in_fault_handler[cpu] = 0;
         return;
     }
     wxjump_put_region(region);
@@ -706,6 +739,7 @@ static void do_page_fault_before(hook_fargs3_t *fargs, void *udata)
     if (ec != 0x24 && ec != 0x20) {
         wx_fault_el1_skip_count++;
         kfn_mmput(mm);
+        wx_in_fault_handler[cpu] = 0;
         return;
     }
 
@@ -714,6 +748,7 @@ static void do_page_fault_before(hook_fargs3_t *fargs, void *udata)
      * acquires its own lock). If contended, skip and let kernel handle. */
     if (!wx_mmap_read_trylock(mm)) {
         kfn_mmput(mm);
+        wx_in_fault_handler[cpu] = 0;
         return;
     }
 
@@ -736,6 +771,7 @@ static void do_page_fault_before(hook_fargs3_t *fargs, void *udata)
 
     wx_mmap_read_unlock(mm);
     kfn_mmput(mm);
+    wx_in_fault_handler[cpu] = 0;
 }
 
 /* ========== 用户缓冲区读取 (通过页表遍历) ========== */
@@ -1700,8 +1736,9 @@ static long wxjump_exit(void *reserved)
 static long wxjump_control(const char *args, char *__user out_msg, int outlen)
 {
     pr_info("wxjump: control: %s\n", args ? args : "(null)");
-    pr_info("wxjump: stats: total=%lu read=%lu exec=%lu el1_skip=%lu\n",
-            wx_fault_total_count, wx_fault_read_count, wx_fault_exec_count, wx_fault_el1_skip_count);
+    pr_info("wxjump: stats: total=%lu read=%lu exec=%lu el1_skip=%lu reentry=%lu\n",
+            wx_fault_total_count, wx_fault_read_count, wx_fault_exec_count,
+            wx_fault_el1_skip_count, wx_fault_reentry_count);
     return 0;
 }
 
