@@ -1,0 +1,7 @@
+-xc
+-std=gnu11
+-I../kernel/include
+-I../kernel/patch/include
+-I../kernel/linux/include
+-I../kernel/linux/arch/arm64/include
+-I../kernel/linux/tools/arch/arm64/include

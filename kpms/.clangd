@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - --target=aarch64-none-elf
+
+Index:
+  Background: Build

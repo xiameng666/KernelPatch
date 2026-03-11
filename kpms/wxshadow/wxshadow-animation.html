@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>wxshadow W^X 动画演示</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Consolas', 'Monaco', monospace; background: #1a1a2e; color: #eee; padding: 20px; }
+h1 { text-align: center; color: #e94560; margin-bottom: 10px; font-size: 22px; }
+.subtitle { text-align: center; color: #888; margin-bottom: 20px; font-size: 13px; }
+
+/* Scenario tabs */
+.tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; }
+.tab { padding: 8px 18px; background: #16213e; border: 1px solid #0f3460; border-radius: 6px; cursor: pointer; font-size: 13px; transition: all 0.3s; }
+.tab:hover { background: #0f3460; }
+.tab.active { background: #e94560; border-color: #e94560; color: #fff; }
+
+/* Main layout */
+.stage { display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; margin-bottom: 20px; min-height: 420px; }
+
+/* Page boxes */
+.page-box { width: 280px; border: 2px solid #333; border-radius: 10px; padding: 15px; background: #16213e; position: relative; transition: all 0.5s; }
+.page-box.highlight { border-color: #e94560; box-shadow: 0 0 20px rgba(233,69,96,0.4); }
+.page-box.active-exec { border-color: #00d2ff; box-shadow: 0 0 20px rgba(0,210,255,0.4); }
+.page-box.active-read { border-color: #00ff88; box-shadow: 0 0 20px rgba(0,255,136,0.4); }
+.page-title { font-size: 14px; font-weight: bold; margin-bottom: 8px; text-align: center; }
+.page-title.shadow { color: #00d2ff; }
+.page-title.original { color: #00ff88; }
+.page-perms { text-align: center; font-size: 12px; padding: 3px 8px; border-radius: 4px; display: inline-block; margin-bottom: 8px; }
+.perms-x { background: #00d2ff22; color: #00d2ff; border: 1px solid #00d2ff44; }
+.perms-r { background: #00ff8822; color: #00ff88; border: 1px solid #00ff8844; }
+.perms-rx { background: #ffaa0022; color: #ffaa00; border: 1px solid #ffaa0044; }
+.perms-none { background: #66666622; color: #666; border: 1px solid #66666644; }
+
+.inst-line { font-size: 12px; padding: 4px 8px; margin: 2px 0; border-radius: 4px; transition: all 0.4s; white-space: nowrap; }
+.inst-line.normal { background: #1a1a2e; }
+.inst-line.brk { background: #e9456033; color: #ff6b6b; font-weight: bold; }
+.inst-line.branch { background: #00d2ff22; color: #00d2ff; font-weight: bold; }
+.inst-line.executing { background: #ffaa0044; outline: 2px solid #ffaa00; }
+.inst-line.reading { background: #00ff8844; outline: 2px solid #00ff88; }
+
+/* PTE arrow */
+.pte-section { width: 160px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.pte-box { background: #0f3460; border: 2px solid #e94560; border-radius: 8px; padding: 10px; text-align: center; margin-bottom: 15px; }
+.pte-label { font-size: 11px; color: #888; }
+.pte-value { font-size: 13px; color: #e94560; font-weight: bold; margin-top: 4px; }
+.pte-arrow { font-size: 28px; transition: all 0.5s; }
+.pte-arrow.point-left { color: #00ff88; transform: rotate(180deg); }
+.pte-arrow.point-right { color: #00d2ff; transform: rotate(0deg); }
+
+/* CPU / CRC actor */
+.actor-box { width: 120px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.actor { width: 80px; height: 80px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; transition: all 0.5s; }
+.actor.cpu { background: #ffaa0033; border: 2px solid #ffaa00; color: #ffaa00; }
+.actor.crc { background: #00ff8833; border: 2px solid #00ff88; color: #00ff88; }
+.actor.kernel { background: #e9456033; border: 2px solid #e94560; color: #e94560; }
+.actor.hidden { opacity: 0.2; }
+
+/* Trampoline box */
+.trampoline-box { width: 240px; border: 2px solid #9b59b6; border-radius: 10px; padding: 15px; background: #16213e; }
+.trampoline-box .page-title { color: #9b59b6; }
+
+/* Controls */
+.controls { display: flex; justify-content: center; gap: 12px; margin-bottom: 15px; }
+.btn { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: inherit; transition: all 0.2s; }
+.btn-primary { background: #e94560; color: #fff; }
+.btn-primary:hover { background: #ff6b6b; }
+.btn-secondary { background: #0f3460; color: #fff; border: 1px solid #333; }
+.btn-secondary:hover { background: #16213e; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Narration */
+.narration { max-width: 800px; margin: 0 auto; background: #0f3460; border-radius: 8px; padding: 15px; font-size: 13px; line-height: 1.8; min-height: 60px; }
+.narration .step-num { color: #e94560; font-weight: bold; }
+.narration .keyword { color: #00d2ff; }
+.narration .safe { color: #00ff88; }
+.narration .danger { color: #ff6b6b; }
+
+/* State indicator */
+.state-bar { display: flex; justify-content: center; gap: 20px; margin-bottom: 15px; font-size: 12px; }
+.state-item { padding: 4px 12px; border-radius: 12px; }
+.state-item.active { background: #e94560; }
+.state-item.inactive { background: #333; color: #666; }
+</style>
+</head>
+<body>
+
+<h1>wxshadow W^X 影子内存动画</h1>
+<p class="subtitle">点击「下一步」逐步观看执行流程</p>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchScenario('brk')">Case 1: BRK 断点</div>
+  <div class="tab" onclick="switchScenario('inline')">Case 2: Stealth Inline Hook</div>
+  <div class="tab" onclick="switchScenario('crc')">Case 3: CRC 校验欺骗</div>
+</div>
+
+<div class="state-bar" id="stateBar"></div>
+
+<div class="controls">
+  <button class="btn btn-secondary" id="btnPrev" onclick="prevStep()">⟵ 上一步</button>
+  <button class="btn btn-primary" id="btnNext" onclick="nextStep()">下一步 ⟶</button>
+  <button class="btn btn-secondary" onclick="resetScenario()">重置</button>
+</div>
+
+<div class="stage" id="stage"></div>
+
+<div class="narration" id="narration">选择一个场景，然后点击「下一步」开始。</div>
+
+<script>
+let currentScenario = 'brk';
+let currentStep = -1;
+
+const scenarios = {
+  brk: {
+    title: 'BRK #7 断点命中流程',
+    steps: [
+      {
+        narration: '<span class="step-num">初始状态</span> — PTE 指向<span class="keyword">影子页</span>（权限 --x，只可执行）。影子页是原始代码的拷贝，但 0x1234 处被写入了 <span class="danger">BRK #7</span>。原始页保持干净。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['cpu'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第①步</span> — CPU 正常执行影子页代码，0x1000、0x1004 都是原始指令的拷贝，和原始代码行为一致。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: true, origHighlight: false,
+        execLine: 0, readLine: -1, actors: ['cpu'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第②步</span> — CPU 执行到 0x1234，取到的指令是 <span class="danger">BRK #7</span>！CPU 触发断点异常，陷入内核 EL1。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: true, origHighlight: false,
+        execLine: 3, readLine: -1, actors: ['cpu', 'kernel'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第③步</span> — 内核 <span class="danger">brk_handler</span> 接管：打印寄存器快照（x0-x7, lr, sp）到 dmesg，应用预配置的寄存器修改。<br>注意：<span class="keyword">PC 不变</span>，仍指向 0x1234。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['kernel'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第④步</span> — 内核切换 PTE → <span class="safe">原始页</span>（权限 r-x），刷新 TLB。状态变为 <span class="keyword">STEPPING</span>。开启单步模式。',
+        pteTarget: 'original', state: 'STEPPING',
+        shadowHighlight: false, origHighlight: true,
+        execLine: -1, readLine: -1, actors: ['kernel'],
+        shadowPerms: '(未映射)', origPerms: 'r-x',
+      },
+      {
+        narration: '<span class="step-num">第⑤步</span> — 异常返回用户态，CPU 在<span class="keyword">同一个 PC=0x1234</span> 重新取指。这次 PTE 指向原始页，取到的是真实的 <span class="safe">ADD x0,x1,x2</span>。单步模式下只执行这一条。',
+        pteTarget: 'original', state: 'STEPPING',
+        shadowHighlight: false, origHighlight: true,
+        execLine: 3, readLine: -1, actors: ['cpu'],
+        shadowPerms: '(未映射)', origPerms: 'r-x',
+      },
+      {
+        narration: '<span class="step-num">第⑥步</span> — 单步异常触发，内核 <span class="keyword">step_handler</span> 切换 PTE 回影子页（--x），关闭单步，状态恢复 SHADOW_X。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: true, origHighlight: false,
+        execLine: 4, readLine: -1, actors: ['cpu'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">完成</span> — 回到正常执行。原始指令已被执行，断点处理完毕，CPU 继续跑影子页后续代码。<br><span class="safe">整个过程用户态无感知，没有 JS 回调，结果在 dmesg/logcat 中查看。</span>',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: 5, readLine: -1, actors: ['cpu'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+    ]
+  },
+  inline: {
+    title: 'Stealth Inline Hook 流程',
+    steps: [
+      {
+        narration: '<span class="step-num">初始状态</span> — 影子页 0x1234 处被写入 <span class="keyword">5条跳转指令</span>（MOVZ/MOVK/BR，共20字节），指向内存池中的 thunk。原始页保持干净。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['cpu'], showTrampoline: true,
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第①步</span> — CPU 执行到 0x1234，取到 <span class="keyword">MOVZ x16, #...</span>。这不是异常，是正常指令！CPU 开始把目标地址装入 x16。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: true, origHighlight: false,
+        execLine: 3, readLine: -1, actors: ['cpu'], showTrampoline: true,
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第②步</span> — CPU 执行 <span class="keyword">BR x16</span>，跳到内存池中的 <span class="keyword">thunk</span>。thunk 保存所有寄存器（x0-x30, sp, nzcv），构造 HookContext 结构体。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['cpu'], showTrampoline: true, thunkActive: true,
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第③步</span> — thunk 调用 <span class="keyword">JS 回调函数</span>！这就是为什么 stealth inline hook 有回调而 BRK 没有——执行流被劫持到了用户态代码，不经过内核。<br><span class="safe">JS 可以读写 ctx.x0, ctx.x1 等寄存器。</span>',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['cpu'], showTrampoline: true, thunkActive: true, jsCallback: true,
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第④步</span> — JS 回调返回。thunk 恢复所有寄存器（JS 的修改已生效），跳到 <span class="keyword">trampoline</span>。trampoline 里是被覆盖的原始 5 条指令。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['cpu'], showTrampoline: true, trampolineActive: true,
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第⑤步</span> — trampoline 执行完原始 5 条指令后，<span class="keyword">BR x16</span> 跳回影子页 0x1234+20=0x1248，继续正常执行。<br><span class="safe">原始指令全部被执行，一条不少。</span>',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: true, origHighlight: false,
+        execLine: 8, readLine: -1, actors: ['cpu'], showTrampoline: true,
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">完成</span> — 整个流程：<span class="keyword">影子页跳转 → thunk保存寄存器 → JS回调 → 恢复寄存器 → trampoline执行原始指令 → 跳回影子页</span>。<br>不经过内核，有 JS 回调，CRC 读不到跳转指令（W^X 保护）。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['cpu'], showTrampoline: true,
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+    ]
+  },
+  crc: {
+    title: 'CRC32 校验欺骗流程',
+    steps: [
+      {
+        narration: '<span class="step-num">初始状态</span> — 正常运行，PTE → 影子页（--x）。影子页 0x1234 处有 BRK 或跳转指令（不管哪种，CRC 都读不到）。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['cpu', 'crc'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第①步</span> — App 的 CRC 校验线程执行 <span class="keyword">LDR x0, [0x1000]</span>，想读取代码页计算校验和。影子页权限是 <span class="danger">--x（不可读！）</span>',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: true, origHighlight: false,
+        execLine: -1, readLine: 0, actors: ['crc'],
+        shadowPerms: '--x 🚫读', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第②步</span> — 读取失败！触发 <span class="danger">数据中止异常</span>（Data Abort, WnR=0）。内核 do_page_fault 被 wxshadow hook 拦截，进入 <span class="keyword">read_fault handler</span>。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['kernel', 'crc'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">第③步</span> — read_fault 切换 PTE → <span class="safe">原始页（r--，只读）</span>，状态变为 ORIG_R。异常返回，CPU <span class="keyword">重试</span>刚才的 LDR 指令。',
+        pteTarget: 'original', state: 'ORIG_R',
+        shadowHighlight: false, origHighlight: true,
+        execLine: -1, readLine: -1, actors: ['kernel'],
+        shadowPerms: '(未映射)', origPerms: 'r--',
+      },
+      {
+        narration: '<span class="step-num">第④步</span> — 这次 LDR 成功了！CRC 读到的是<span class="safe">原始页的干净代码</span>（ADD x0,x1,x2），不是 BRK 或跳转。CRC 继续扫描整个页面...校验通过 ✓',
+        pteTarget: 'original', state: 'ORIG_R',
+        shadowHighlight: false, origHighlight: true,
+        execLine: -1, readLine: 3, actors: ['crc'],
+        shadowPerms: '(未映射)', origPerms: 'r-- ✅读',
+      },
+      {
+        narration: '<span class="step-num">第⑤步</span> — CRC 完成，程序继续执行。下一条指令在同一页上，但原始页权限是 <span class="danger">r--（不可执行！）</span>→ 触发<span class="danger">指令中止异常</span>。',
+        pteTarget: 'original', state: 'ORIG_R',
+        shadowHighlight: false, origHighlight: true,
+        execLine: -1, readLine: -1, actors: ['cpu'],
+        shadowPerms: '(未映射)', origPerms: 'r-- 🚫执行',
+      },
+      {
+        narration: '<span class="step-num">第⑥步</span> — exec_fault handler 切换 PTE 回<span class="keyword">影子页（--x）</span>，状态恢复 SHADOW_X。CPU 重试执行，回到正常状态。',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: true, origHighlight: false,
+        execLine: 0, readLine: -1, actors: ['cpu'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+      {
+        narration: '<span class="step-num">完成</span> — CRC 校验全程只读到了原始代码，<span class="safe">结果完全正确</span>。App 认为代码没有被修改。<br>而 CPU 执行的仍然是影子页（含 BRK/跳转），hook 继续生效。<span class="keyword">这就是 W^X 的核心：可读的没有 hook，可执行的有 hook。</span>',
+        pteTarget: 'shadow', state: 'SHADOW_X',
+        shadowHighlight: false, origHighlight: false,
+        execLine: -1, readLine: -1, actors: ['cpu'],
+        shadowPerms: '--x', origPerms: '(未映射)',
+      },
+    ]
+  }
+};
+
+const shadowInsts_brk = [
+  { addr: '0x1000', code: 'STP x29,x30,[sp,#-16]!', type: 'normal' },
+  { addr: '0x1004', code: 'MOV x29, sp', type: 'normal' },
+  { addr: '0x1008', code: 'LDR x2, [x0, #8]', type: 'normal' },
+  { addr: '0x1234', code: 'BRK #7', type: 'brk' },
+  { addr: '0x1238', code: 'STR x3, [x4]', type: 'normal' },
+  { addr: '0x123C', code: 'LDP x29,x30,[sp],#16', type: 'normal' },
+  { addr: '0x1240', code: 'RET', type: 'normal' },
+];
+
+const origInsts = [
+  { addr: '0x1000', code: 'STP x29,x30,[sp,#-16]!', type: 'normal' },
+  { addr: '0x1004', code: 'MOV x29, sp', type: 'normal' },
+  { addr: '0x1008', code: 'LDR x2, [x0, #8]', type: 'normal' },
+  { addr: '0x1234', code: 'ADD x0, x1, x2', type: 'normal' },
+  { addr: '0x1238', code: 'STR x3, [x4]', type: 'normal' },
+  { addr: '0x123C', code: 'LDP x29,x30,[sp],#16', type: 'normal' },
+  { addr: '0x1240', code: 'RET', type: 'normal' },
+];
+
+const shadowInsts_inline = [
+  { addr: '0x1000', code: 'STP x29,x30,[sp,#-16]!', type: 'normal' },
+  { addr: '0x1004', code: 'MOV x29, sp', type: 'normal' },
+  { addr: '0x1008', code: 'LDR x2, [x0, #8]', type: 'normal' },
+  { addr: '0x1234', code: 'MOVZ x16, #0x5678', type: 'branch' },
+  { addr: '0x1238', code: 'MOVK x16, #0x1234, lsl 16', type: 'branch' },
+  { addr: '0x123C', code: 'MOVK x16, #0xABCD, lsl 32', type: 'branch' },
+  { addr: '0x1240', code: 'MOVK x16, #0x00FF, lsl 48', type: 'branch' },
+  { addr: '0x1244', code: 'BR   x16  → thunk', type: 'branch' },
+  { addr: '0x1248', code: 'BL   other_func', type: 'normal' },
+  { addr: '0x124C', code: 'RET', type: 'normal' },
+];
+
+const trampolineInsts = [
+  { addr: 'thunk+0', code: 'STP 所有寄存器 (保存现场)', type: 'normal' },
+  { addr: 'thunk+N', code: 'BLR js_callback ← JS回调!', type: 'branch' },
+  { addr: 'thunk+M', code: 'LDP 所有寄存器 (恢复现场)', type: 'normal' },
+  { addr: '------', code: '--- trampoline ---', type: 'normal' },
+  { addr: 'tramp+0', code: 'ADD x0, x1, x2  (原始①)', type: 'normal' },
+  { addr: 'tramp+4', code: 'STR x3, [x4]    (原始②)', type: 'normal' },
+  { addr: 'tramp+8', code: 'LDP x29,x30...  (原始③)', type: 'normal' },
+  { addr: 'tramp+C', code: 'MOV x7, #1      (原始④)', type: 'normal' },
+  { addr: 'tramp+10', code: 'NOP             (原始⑤)', type: 'normal' },
+  { addr: 'tramp+14', code: 'BR → 0x1248 (跳回)', type: 'branch' },
+];
+
+function renderStage(step) {
+  const s = scenarios[currentScenario];
+  const data = s.steps[step] || s.steps[0];
+  const isInline = currentScenario === 'inline';
+  const shadowInsts = isInline ? shadowInsts_inline : shadowInsts_brk;
+
+  let html = '';
+
+  // CPU/CRC actor
+  html += '<div class="actor-box">';
+  if (data.actors.includes('cpu')) {
+    html += '<div class="actor cpu">CPU<br>执行</div>';
+  } else if (data.actors.includes('crc')) {
+    html += '<div class="actor crc">CRC<br>读取</div>';
+  }
+  if (data.actors.includes('kernel')) {
+    html += '<div class="actor kernel" style="margin-top:10px">内核<br>handler</div>';
+  }
+  html += '</div>';
+
+  // Shadow page
+  html += `<div class="page-box ${data.shadowHighlight ? (data.pteTarget === 'shadow' ? 'active-exec' : 'highlight') : ''}" id="shadowPage">`;
+  html += '<div class="page-title shadow">影子物理页</div>';
+  html += `<div style="text-align:center"><span class="page-perms ${data.shadowPerms.includes('x') ? 'perms-x' : 'perms-none'}">${data.shadowPerms}</span></div>`;
+  shadowInsts.forEach((inst, i) => {
+    let cls = inst.type;
+    if (data.execLine === i && data.pteTarget === 'shadow') cls += ' executing';
+    if (data.readLine === i && data.pteTarget === 'shadow') cls += ' reading';
+    html += `<div class="inst-line ${cls}">${inst.addr}: ${inst.code}</div>`;
+  });
+  html += '</div>';
+
+  // PTE
+  html += '<div class="pte-section">';
+  html += '<div class="pte-box">';
+  html += '<div class="pte-label">PTE (页表条目)</div>';
+  html += `<div class="pte-value">→ ${data.pteTarget === 'shadow' ? '影子页' : '原始页'}</div>`;
+  html += '</div>';
+  html += `<div class="pte-arrow ${data.pteTarget === 'shadow' ? 'point-right' : 'point-left'}">⟹</div>`;
+  html += `<div style="font-size:11px;color:#888;margin-top:5px">状态: ${data.state}</div>`;
+  html += '</div>';
+
+  // Original page
+  html += `<div class="page-box ${data.origHighlight ? (data.pteTarget === 'original' ? (data.readLine >= 0 ? 'active-read' : 'active-exec') : 'highlight') : ''}" id="origPage">`;
+  html += '<div class="page-title original">原始物理页</div>';
+  let origPermsClass = data.origPerms.includes('r-x') ? 'perms-rx' : data.origPerms.includes('r') ? 'perms-r' : 'perms-none';
+  html += `<div style="text-align:center"><span class="page-perms ${origPermsClass}">${data.origPerms}</span></div>`;
+  origInsts.forEach((inst, i) => {
+    let cls = inst.type;
+    if (data.execLine === i && data.pteTarget === 'original') cls += ' executing';
+    if (data.readLine === i && data.pteTarget === 'original') cls += ' reading';
+    html += `<div class="inst-line ${cls}">${inst.addr}: ${inst.code}</div>`;
+  });
+  html += '</div>';
+
+  // Trampoline (inline hook only)
+  if (data.showTrampoline) {
+    html += '<div class="trampoline-box">';
+    html += '<div class="page-title" style="color:#9b59b6">内存池 (R-X)</div>';
+    trampolineInsts.forEach((inst, i) => {
+      let cls = inst.type;
+      if (data.thunkActive && i <= 2) cls += ' executing';
+      if (data.jsCallback && i === 1) cls = 'branch executing';
+      if (data.trampolineActive && i >= 4 && i <= 9) cls += ' executing';
+      html += `<div class="inst-line ${cls}">${inst.addr}: ${inst.code}</div>`;
+    });
+    html += '</div>';
+  }
+
+  document.getElementById('stage').innerHTML = html;
+  document.getElementById('narration').innerHTML = data.narration;
+
+  // State bar
+  let stateHtml = '';
+  const states = ['SHADOW_X', 'ORIG_R', 'STEPPING'];
+  states.forEach(st => {
+    stateHtml += `<span class="state-item ${data.state === st ? 'active' : 'inactive'}">${st}</span>`;
+  });
+  document.getElementById('stateBar').innerHTML = stateHtml;
+
+  // Button state
+  document.getElementById('btnPrev').disabled = step <= 0;
+  document.getElementById('btnNext').disabled = step >= s.steps.length - 1;
+}
+
+function switchScenario(name) {
+  currentScenario = name;
+  currentStep = 0;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  renderStage(0);
+}
+
+function nextStep() {
+  const s = scenarios[currentScenario];
+  if (currentStep < s.steps.length - 1) {
+    currentStep++;
+    renderStage(currentStep);
+  }
+}
+
+function prevStep() {
+  if (currentStep > 0) {
+    currentStep--;
+    renderStage(currentStep);
+  }
+}
+
+function resetScenario() {
+  currentStep = 0;
+  renderStage(0);
+}
+
+// Keyboard navigation
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); nextStep(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); prevStep(); }
+});
+
+// Init
+renderStage(0);
+switchScenario('brk');
+</script>
+</body>
+</html>

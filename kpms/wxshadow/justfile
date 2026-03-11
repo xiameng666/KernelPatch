@@ -1,0 +1,10 @@
+TC := "C:/Users/24151/Documents/GitHub/KernelPatch/arm-gnu-toolchain-15.2.rel1-mingw-w64-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+KP := "C:/Users/24151/Documents/GitHub/xiaojia-hide/KernelPatch"
+
+default: build push
+
+build:
+    make -C "{{justfile_directory()}}" TARGET_COMPILE={{TC}} KP_DIR={{KP}} clean all
+
+push:
+    MSYS_NO_PATHCONV=1 adb push "{{justfile_directory()}}/wxshadow.kpm" /sdcard/Download/
