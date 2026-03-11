@@ -413,6 +413,7 @@ static int wxjump_auto_cleanup(void *mm, struct wx_region *region,
     if (pi->shadow_page_va) {
         uint64_t shadow_va = pi->shadow_page_va;
         uint64_t saved_orig_pte = pi->orig_pte;
+        uint64_t saved_shadow_pfn = pi->shadow_pfn;
         pi->shadow_page_va = 0;
         pi->state = STATE_NONE;
         pi->orig_pfn = 0;
@@ -421,14 +422,18 @@ static int wxjump_auto_cleanup(void *mm, struct wx_region *region,
         pi->patch_count = 0;
         wx_spin_unlock();
 
-        /* 先恢复原始 PTE 再释放 shadow page，避免悬垂 PTE 指向已释放页 */
+        /* 仅当 PTE 仍指向我们的 shadow page 时才恢复 orig_pte，
+         * 避免 Mapping Changed / VMA Gone 路径覆盖内核已设置的合法新映射 */
         if (saved_orig_pte && mm) {
             uint64_t *pte = get_user_pte(mm, addr, NULL);
             if (pte && (*pte & 1)) {
-                *pte = saved_orig_pte;
-                void *vma = kfn_find_vma(mm, addr);
-                wxjump_flush_tlb_page(
-                    (vma && addr >= *(unsigned long *)vma) ? vma : NULL, addr);
+                uint64_t cur_pfn = (*pte >> 12) & PFN_MASK;
+                if (cur_pfn == saved_shadow_pfn) {
+                    *pte = saved_orig_pte;
+                    void *vma = kfn_find_vma(mm, addr);
+                    wxjump_flush_tlb_page(
+                        (vma && addr >= *(unsigned long *)vma) ? vma : NULL, addr);
+                }
             }
         }
 
@@ -962,7 +967,16 @@ static int wxjump_do_release(void *mm, unsigned long page_addr,
                 if (shadow_va)
                     kfn_free_pages(shadow_va, 0);
                 pr_info("wxjump: shadow page freed for %lx\n", page_addr);
+            } else {
+                /* PTE 恢复失败：保留 shadow 避免悬垂，但向调用方报错 */
+                wxjump_put_region(region);
+                return -11;  /* -EAGAIN */
             }
+        } else {
+            /* VMA 无效或状态已清除，无法恢复 PTE */
+            pr_warn("wxjump: release: VMA invalid for %lx, keeping shadow\n", page_addr);
+            wxjump_put_region(region);
+            return -11;  /* -EAGAIN */
         }
     } else if (pi->state == STATE_SHADOW_X) {
         /* 还有其他 patch，刷新 icache 使恢复的字节生效 */
