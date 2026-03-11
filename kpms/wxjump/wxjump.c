@@ -56,7 +56,7 @@ KPM_DESCRIPTION("W^X Shadow Page Jump Hook - Zero kernel overhead inline hook wi
 #define STATE_SHADOW_X       2   /* 影子页, --x (execute-only, 含跳转指令) */
 
 /* ARM64 PTE 标志 */
-#define PTE_BASE_FLAGS       0xF13ULL            /* Valid + AF + SH + AP 基础标志 */
+#define PTE_BASE_FLAGS       0xF03ULL            /* Valid + AF + SH + nG (AttrIndx=0 → MT_NORMAL) */
 #define PTE_USER_RDONLY      0xC0ULL              /* 用户只读+可执行 */
 #define PTE_UXN_USER_RO      0x400000000000C0ULL  /* UXN + 用户只读 (不可执行) */
 
@@ -73,6 +73,7 @@ KPM_DESCRIPTION("W^X Shadow Page Jump Hook - Zero kernel overhead inline hook wi
  */
 struct page_info {
     uint64_t orig_pfn;        /* 原始页帧号 */
+    uint64_t orig_pte;        /* 原始完整 PTE 值 (用于精确恢复) */
     uint64_t shadow_pfn;      /* 影子页帧号 */
     uint64_t shadow_page_va;  /* 影子页内核虚拟地址 */
     uint32_t state;           /* STATE_NONE / ORIG_R / SHADOW_X */
@@ -103,8 +104,7 @@ static unsigned long (*kfn___get_free_pages)(unsigned int gfp, unsigned int orde
 static void  (*kfn_free_pages)(unsigned long addr, unsigned int order);
 
 static void  (*kfn___flush_icache_range)(unsigned long start, unsigned long end);
-static void  (*kfn_flush_dcache_page)(void *page);
-static void  (*kfn___flush_tlb_range)(void *vma, unsigned long start, unsigned long end,
+static void  (*kfn___flush_tlb_range)
                                        unsigned long stride, int last_level, int tlb_level);
 static void *(*kfn_flush_tlb_page)(void);
 
@@ -175,6 +175,14 @@ static inline void wx_spin_unlock(void)
 }
 
 /* ========== 缓存/TLB ========== */
+
+static inline void wx_flush_dcache_va(uint64_t va, unsigned long size)
+{
+    uint64_t addr;
+    for (addr = va; addr < va + size; addr += 64)
+        asm volatile("dc cvau, %0" :: "r"(addr) : "memory");
+    dsb(ish);
+}
 
 static inline void wx_flush_icache(unsigned long addr)
 {
@@ -556,8 +564,8 @@ static int wxjump_handle_exec_fault(void *mm, unsigned long addr)
         return -1;
     }
 
-    if (kfn_flush_dcache_page && pi->shadow_page_va)
-        kfn_flush_dcache_page((void *)pi->shadow_page_va);
+    if (pi->shadow_page_va)
+        wx_flush_dcache_va(pi->shadow_page_va, WX_PAGE_SIZE);
 
     /* 切到 shadow page (--x, execute-only) */
     ret = wxjump_switch_mapping(vma, page_addr, pi->shadow_pfn, 0);
@@ -720,7 +728,10 @@ static int wxjump_do_patch(void *mm, unsigned long page_addr,
             wxjump_put_region(region);
             return 0;
         }
-        wxjump_put_region(region);
+
+        /* region 存在但 shadow_page_va=0 (stale page, 之前 release 过)
+         * 直接在现有 region 上为此 page 重建 shadow，不递归也不 fall-through */
+        goto setup_shadow_on_existing;
     }
 
     /* 需要创建新的 shadow page */
@@ -730,14 +741,18 @@ static int wxjump_do_patch(void *mm, unsigned long page_addr,
         return -1;
     }
 
-    /* 并发检查 */
+    /* 并发检查: 另一线程可能刚创建了 region */
     wx_spin_lock();
     struct wx_region *existing;
     list_for_each_entry(existing, &region_list, list) {
         if (existing->mm == mm &&
             page_addr >= existing->vm_start && page_addr < existing->vm_end) {
+            existing->refcount++;
             wx_spin_unlock();
-            return wxjump_do_patch(mm, page_addr, user_buf, len, offset);
+            region = existing;
+            idx = wxjump_page_index(region, page_addr);
+            pi = &region->pages[idx];
+            goto setup_shadow_on_existing;
         }
     }
     wx_spin_unlock();
@@ -770,32 +785,47 @@ static int wxjump_do_patch(void *mm, unsigned long page_addr,
     new_region->vm_end = vm_end;
     new_region->pages = pages;
     new_region->nr_pages = nr_pages;
-    new_region->refcount = 1;
+    new_region->refcount = 2;  /* 1 for list + 1 for current use */
 
     wx_spin_lock();
     list_add(&new_region->list, &region_list);
     wx_spin_unlock();
 
-    /* 设置 shadow page */
+    region = new_region;
     idx = wxjump_page_index(new_region, page_addr);
     pi = &pages[idx];
+
+setup_shadow_on_existing:
+    /* 设置 shadow page (region/idx/pi 已确定) */
+    if (!vma) {
+        vma = kfn_find_vma(mm, page_addr);
+        if (!vma || page_addr < *(unsigned long *)vma) {
+            pr_err("wxjump: patch: no VMA for %lx\n", page_addr);
+            wxjump_put_region(region);
+            return -1;
+        }
+    }
 
     uint64_t *pte = get_user_pte(mm, page_addr, NULL);
     if (!pte || !((*pte) & 1)) {
         pr_err("wxjump: patch: no PTE for %lx\n", page_addr);
+        wxjump_put_region(region);
         return -14;
     }
 
     uint64_t pte_val = *pte;
     uint64_t orig_pfn = (pte_val >> 12) & PFN_MASK;
     pi->orig_pfn = orig_pfn;
+    pi->orig_pte = pte_val;
 
     uint64_t orig_va = wx_pa_to_va(orig_pfn << 12);
 
     /* 分配 shadow page */
     unsigned long shadow_va = kfn___get_free_pages(wx_gfp_kernel, 0);
-    if (!shadow_va)
+    if (!shadow_va) {
+        wxjump_put_region(region);
         return -12;
+    }
 
     uint64_t shadow_pa = wx_va_to_pa(shadow_va);
     uint64_t shadow_pfn = shadow_pa >> 12;
@@ -817,6 +847,10 @@ static int wxjump_do_patch(void *mm, unsigned long page_addr,
         kfn_free_pages(shadow_va, 0);
         pi->shadow_pfn = 0;
         pi->shadow_page_va = 0;
+        pi->state = STATE_NONE;
+        pi->orig_pfn = 0;
+        pi->orig_pte = 0;
+        wxjump_put_region(region);
         return ret;
     }
 
@@ -824,6 +858,7 @@ static int wxjump_do_patch(void *mm, unsigned long page_addr,
 
     pr_info("wxjump: patched new shadow at %lx+%zu (%zu bytes) orig_pfn=%lx shadow_pfn=%lx\n",
             page_addr, offset, len, (unsigned long)orig_pfn, (unsigned long)shadow_pfn);
+    wxjump_put_region(region);
     return 0;
 }
 
@@ -880,12 +915,23 @@ static int wxjump_do_release(void *mm, unsigned long page_addr,
         if (vma && page_addr >= *(unsigned long *)vma && pi->state != STATE_NONE) {
             uint64_t shadow_va = pi->shadow_page_va;
 
-            wxjump_switch_mapping(vma, page_addr, pi->orig_pfn, PTE_USER_RDONLY);
+            /* 精确恢复原始 PTE (保留 PXN 等所有原始标志) */
+            {
+                void *release_mm = NULL;
+                if (wx_vma_vm_mm_offset >= 0 && vma)
+                    release_mm = *(void **)((uint64_t)vma + wx_vma_vm_mm_offset);
+                uint64_t *release_pte = get_user_pte(release_mm, page_addr, NULL);
+                if (release_pte) {
+                    *release_pte = pi->orig_pte;
+                    wxjump_flush_tlb_page(vma, page_addr);
+                }
+            }
             wx_flush_icache(page_addr);  /* 清除 shadow 指令的 I-cache 残留 */
 
             wx_spin_lock();
             pi->shadow_page_va = 0;
             pi->orig_pfn = 0;
+            pi->orig_pte = 0;
             pi->shadow_pfn = 0;
             pi->state = STATE_NONE;
             wx_spin_unlock();
@@ -996,9 +1042,8 @@ static void exit_mmap_before(hook_fargs1_t *fargs, void *udata)
                 void *vma = kfn_find_vma(mm, addr);
                 if (vma && addr >= *(unsigned long *)vma) {
                     uint64_t *pte = get_user_pte(mm, addr, NULL);
-                    if (pte && (*pte & 1)) {
-                        uint64_t new_pte = (pi->orig_pfn << 12) | 0xFC3ULL;
-                        *pte = new_pte;
+                    if (pte && (*pte & 1) && pi->orig_pte) {
+                        *pte = pi->orig_pte;
                         wxjump_flush_tlb_page(vma, addr);
                     }
                 }
@@ -1052,8 +1097,8 @@ static int resolve_symbols(void)
 
     uint64_t tcr = 0;
     asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
-    int t0sz = (tcr >> 16) & 0x3F;
-    wx_page_offset_base = -1ULL << (63 - t0sz);
+    int t1sz = (tcr >> 16) & 0x3F;
+    wx_page_offset_base = -1ULL << (64 - t1sz);
 
     /* physvirt_offset 检测 */
     unsigned long test_page = kfn___get_free_pages(wx_gfp_kernel, 0);
@@ -1072,17 +1117,17 @@ static int resolve_symbols(void)
         kfn_free_pages(test_page, 0);
     }
 
-    /* Page table config */
-    uint64_t tg0 = (tcr >> 30) & 3;
+    /* Page table config (TG1: bits[31:30], 内核空间页粒度) */
+    uint64_t tg1 = (tcr >> 30) & 3;
     int bits_per_level;
-    if (tg0 == 1) {
-        wx_page_shift = 14; bits_per_level = 11;
-    } else if (tg0 == 3) {
-        wx_page_shift = 16; bits_per_level = 13;
+    if (tg1 == 1) {
+        wx_page_shift = 14; bits_per_level = 11;  /* TG1=0b01 → 16KB */
+    } else if (tg1 == 3) {
+        wx_page_shift = 16; bits_per_level = 13;  /* TG1=0b11 → 64KB */
     } else {
-        wx_page_shift = 12; bits_per_level = 9;
+        wx_page_shift = 12; bits_per_level = 9;   /* TG1=0b10 → 4KB */
     }
-    wx_page_level = (60 - t0sz) / bits_per_level;
+    wx_page_level = (60 - t1sz) / bits_per_level;
     pr_info("wxjump: page_shift=%d page_level=%d\n", wx_page_shift, wx_page_level);
 
     /* Spinlock */
@@ -1097,9 +1142,7 @@ static int resolve_symbols(void)
             pr_warn("wxjump: no TLB flush function, will use TLBI instruction\n");
     }
 
-    /* Cache */
-    RESOLVE_REQUIRED("flush_dcache_page", kfn_flush_dcache_page);
-
+    /* Cache (flush_dcache_page 不再需要，已用 dc cvau 内联汇编替代) */
     kfn___flush_icache_range = (typeof(kfn___flush_icache_range))kallsyms_lookup_name("__flush_icache_range");
     if (!kfn___flush_icache_range)
         kfn___flush_icache_range = (typeof(kfn___flush_icache_range))kallsyms_lookup_name("flush_icache_range");
@@ -1411,9 +1454,15 @@ static long wxjump_exit(void *reserved)
 
             unsigned long addr = r->vm_start + ((unsigned long)j << 12);
 
-            if (vma && pi->orig_pfn &&
+            if (vma && pi->orig_pte &&
                 (pi->state == STATE_SHADOW_X || pi->state == STATE_ORIG_R)) {
-                if (!wxjump_switch_mapping(vma, addr, pi->orig_pfn, PTE_USER_RDONLY)) {
+                void *exit_mm = NULL;
+                if (wx_vma_vm_mm_offset >= 0 && vma)
+                    exit_mm = *(void **)((uint64_t)vma + wx_vma_vm_mm_offset);
+                uint64_t *exit_pte = get_user_pte(exit_mm, addr, NULL);
+                if (exit_pte) {
+                    *exit_pte = pi->orig_pte;
+                    wxjump_flush_tlb_page(vma, addr);
                     wx_flush_icache(addr);
                 }
             }
