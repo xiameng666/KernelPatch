@@ -1,66 +1,10 @@
-# kdbg KPM justfile
-# 用法: just build / just push / just load / just unload / just clean
+TC := "C:/Users/24151/Documents/GitHub/无痕hook/KernelPatch/arm-gnu-toolchain-15.2.rel1-mingw-w64-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+KP := "C:/Users/24151/Documents/GitHub/无痕hook/KernelPatch"
 
-# ========== 配置 ==========
-# 工具链路径 (项目自带的 arm-gnu-toolchain)
-TOOLCHAIN_DIR := "../../arm-gnu-toolchain-15.2.rel1-mingw-w64-x86_64-aarch64-none-elf"
-TARGET_COMPILE := TOOLCHAIN_DIR + "/bin/aarch64-none-elf-"
-KP_DIR := "../.."
+default: build push
 
-# 设备上的路径
-DEVICE_KPM_DIR := "/data/adb/kp/modules"
-SUPERKEY := env("SUPERKEY", "your_superkey_here")
-
-# KPM 名称
-KPM_NAME := "kdbg"
-KPM_FILE := KPM_NAME + ".kpm"
-
-# ========== 构建 ==========
-
-# 默认: 编译 KPM
 build:
-    make -C "{{justfile_directory()}}" \
-        TARGET_COMPILE="{{TARGET_COMPILE}}" \
-        KP_DIR="{{KP_DIR}}"
+    make -C "{{justfile_directory()}}" TARGET_COMPILE={{TC}} KP_DIR={{KP}} CFLAGS="-fno-builtin -pipe" clean all
 
-# 清理编译产物
-clean:
-    make -C "{{justfile_directory()}}" clean
-
-# 重新编译
-rebuild: clean build
-
-# ========== 设备操作 ==========
-
-# 推送到设备
-push: build
-    adb push "{{justfile_directory()}}/{{KPM_FILE}}" "{{DEVICE_KPM_DIR}}/{{KPM_FILE}}"
-    @echo "pushed {{KPM_FILE}} to {{DEVICE_KPM_DIR}}"
-
-# 加载模块 (通过 kpatch 或 supercall)
-load:
-    adb shell "su -c '/data/adb/kp/kpatch load {{DEVICE_KPM_DIR}}/{{KPM_FILE}}'"
-    @echo "{{KPM_NAME}} loaded"
-
-# 卸载模块
-unload:
-    adb shell "su -c '/data/adb/kp/kpatch unload {{KPM_NAME}}'"
-    @echo "{{KPM_NAME}} unloaded"
-
-# 查询模块状态
-status:
-    adb shell "su -c '/data/adb/kp/kpatch control {{KPM_NAME}} status'"
-
-# 一键: 编译 → 推送 → 加载
-deploy: push load
-
-# 重新部署: 卸载 → 编译 → 推送 → 加载
-redeploy: unload push load
-
-# 查看内核日志
-dmesg:
-    adb shell "su -c 'dmesg | grep kdbg | tail -30'"
-
-# 查看所有已加载模块
-list:
-    adb shell "su -c '/data/adb/kp/kpatch list'"
+push:
+    MSYS_NO_PATHCONV=1 adb push "{{justfile_directory()}}/kdbg.kpm" /sdcard/Download/
