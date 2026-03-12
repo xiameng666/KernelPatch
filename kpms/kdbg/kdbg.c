@@ -21,6 +21,8 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/sched.h>
+#include <linux/pid.h>
 #include <asm/ptrace.h>
 #include <asm/current.h>
 #include <hook.h>
@@ -51,8 +53,8 @@ static int (*kfn_copy_to_kernel_nofault)(void *dst, const void *src,
 static int (*kfn_copy_to_user)(void *to, const void *from, unsigned long n);
 static int (*kfn_copy_from_user)(void *to, const void *from, unsigned long n);
 
-/* 信号 + 文件路径 */
-static int (*kfn_send_sig)(int sig, void *info, void *p, int type);
+/* 信号: send_sig(int sig, struct task_struct *p, int priv) — 3 个参数 */
+static int (*kfn_send_sig)(int sig, void *p, int priv);
 static char *(*kfn_d_path)(const void *path, char *buf, int buflen);
 static void *(*kfn_fget)(unsigned int fd);
 static void (*kfn_fput)(void *file);
@@ -359,9 +361,8 @@ static void before_do_debug_exception(hook_fargs3_t *args, void *udata)
     /* PID 过滤: 仅处理目标进程的调试异常 */
     if (g_target_pid) {
         struct task_struct *tsk = (struct task_struct *)current;
-        int pid = *(int *)((char *)tsk + 0x10); /* offset of pid in task_struct */
-        /* 备用: 用 tgid (thread group leader) 匹配 */
-        int tgid = *(int *)((char *)tsk + 0x14);
+        pid_t pid = __task_pid_nr_ns(tsk, PIDTYPE_PID, NULL);
+        pid_t tgid = __task_pid_nr_ns(tsk, PIDTYPE_TGID, NULL);
         if (pid != g_target_pid && tgid != g_target_pid)
             return;
     }
@@ -446,7 +447,7 @@ static void before_mmap(hook_fargs6_t *args, void *udata)
 
     /* 检查是否是目标进程 */
     struct task_struct *tsk = (struct task_struct *)current;
-    int tgid = *(int *)((char *)tsk + 0x14);
+    pid_t tgid = __task_pid_nr_ns(tsk, PIDTYPE_TGID, NULL);
     if (tgid != g_target_pid)
         return;
 
@@ -475,13 +476,13 @@ static void before_mmap(hook_fargs6_t *args, void *udata)
         return;
 
     /* 检查路径是否包含目标 SO 名 */
-    if (__builtin_strstr(path, g_mmap_target_so)) {
+    if (strstr(path, g_mmap_target_so)) {
         g_mmap_matched = 1;
         /* 保存完整路径 */
-        int plen = __builtin_strlen(path);
+        int plen = strlen(path);
         if (plen >= (int)sizeof(g_mmap_so_path))
             plen = sizeof(g_mmap_so_path) - 1;
-        __builtin_memcpy(g_mmap_so_path, path, plen);
+        memcpy(g_mmap_so_path, path, plen);
         g_mmap_so_path[plen] = 0;
 
         unsigned long len = (unsigned long)syscall_argn(args, 1);
@@ -509,7 +510,7 @@ static void after_mmap(hook_fargs6_t *args, void *udata)
     /* SIGSTOP 冻结目标进程 */
     if (kfn_send_sig) {
         struct task_struct *tsk = (struct task_struct *)current;
-        kfn_send_sig(19 /* SIGSTOP */, (void *)0 /* SEND_SIG_PRIV */, tsk, 0);
+        kfn_send_sig(19 /* SIGSTOP */, tsk, 1 /* priv */);
     }
 
     pr_info("kdbg: SO loaded at base=%llx size=%llx, process frozen\n",
@@ -528,23 +529,30 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
 
     /*
      * 拦截 PR_SET_NAME (option=15) 用于 spawn 监控
+     * 只在 g_spawn_watching=1 时才处理, 避免对所有 PR_SET_NAME 造成开销
      * 不设置 skip_origin, 让原始 prctl 继续执行
      */
-    if (option == 15 && g_spawn_watching && !g_spawn_found) {
+    if (option == 15 && g_spawn_watching) {
         char comm[TASK_COMM_LEN];
         if (compat_strncpy_from_user(comm, (const char *)uarg2,
                                       TASK_COMM_LEN - 1) > 0) {
             comm[TASK_COMM_LEN - 1] = 0;
-            if (__builtin_strstr(comm, g_spawn_target_comm)) {
-                struct task_struct *tsk = (struct task_struct *)current;
-                int tgid = *(int *)((char *)tsk + 0x14);
+            struct task_struct *tsk = (struct task_struct *)current;
+            pid_t tgid = __task_pid_nr_ns(tsk, PIDTYPE_TGID, NULL);
+
+            /* 调试日志: 打印每个 PR_SET_NAME (仅监控期间) */
+            pr_info("kdbg: PR_SET_NAME pid=%d comm='%s' target='%s' match=%d\n",
+                    tgid, comm, g_spawn_target_comm,
+                    strstr(comm, g_spawn_target_comm) ? 1 : 0);
+
+            if (!g_spawn_found && strstr(comm, g_spawn_target_comm)) {
                 g_spawn_pid = tgid;
                 g_spawn_found = 1;
                 g_spawn_watching = 0;
 
                 /* SIGSTOP 冻结进程 */
                 if (kfn_send_sig)
-                    kfn_send_sig(19 /* SIGSTOP */, (void *)0, tsk, 0);
+                    kfn_send_sig(19 /* SIGSTOP */, tsk, 1 /* priv */);
 
                 pr_info("kdbg: spawn detected: '%s' pid=%d, frozen\n",
                         comm, g_spawn_pid);
@@ -741,13 +749,15 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
         /* arg2 = 用户态字符串 (目标包名) */
         if (compat_strncpy_from_user(g_spawn_target_comm, (const char *)uarg2,
                                       sizeof(g_spawn_target_comm) - 1) <= 0) {
+            pr_err("kdbg: SPAWN_WATCH: 读取用户态字符串失败\n");
             args->ret = -1; return;
         }
         g_spawn_target_comm[sizeof(g_spawn_target_comm) - 1] = 0;
         g_spawn_found = 0;
         g_spawn_pid = 0;
         g_spawn_watching = 1;
-        pr_info("kdbg: spawn watch started for '%s'\n", g_spawn_target_comm);
+        pr_info("kdbg: spawn watch started for '%s' (len=%d)\n",
+                g_spawn_target_comm, (int)strlen(g_spawn_target_comm));
         args->ret = 0;
         return;
     }
@@ -780,10 +790,10 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
             args->ret = -1; return;
         }
         g_target_pid = ma.pid;
-        int slen = __builtin_strlen(ma.so_name);
+        int slen = strlen(ma.so_name);
         if (slen >= (int)sizeof(g_mmap_target_so))
             slen = sizeof(g_mmap_target_so) - 1;
-        __builtin_memcpy(g_mmap_target_so, ma.so_name, slen);
+        memcpy(g_mmap_target_so, ma.so_name, slen);
         g_mmap_target_so[slen] = 0;
 
         g_mmap_so_found = 0;
@@ -805,7 +815,7 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
         struct kdbg_mmap_result mr;
         mr.base = g_mmap_so_base;
         mr.size = g_mmap_so_size;
-        __builtin_memcpy(mr.path, g_mmap_so_path, sizeof(mr.path));
+        memcpy(mr.path, g_mmap_so_path, sizeof(mr.path));
         if (compat_copy_to_user((void *)uarg2, &mr, sizeof(mr))) {
             args->ret = -1; return;
         }
@@ -939,15 +949,9 @@ static long kdbg_control(const char *ctl_args, char *__user out_msg, int outlen)
     pr_info("kdbg: control cmd: %s\n", ctl_args);
 
     /* 支持通过 sc_kpm_control 发送简单命令 */
-    if (ctl_args && !__builtin_strcmp(ctl_args, "status")) {
-        char msg[256];
-        int len = 0;
-        len += pr_info("stopped=%d cpu=%d sw_bp=%d\n",
-                        g_stopped, g_stopped_cpu, g_num_sw_bp);
-        if (out_msg && outlen > 0) {
-            int n = len < outlen ? len : outlen - 1;
-            compat_copy_to_user(out_msg, msg, n);
-        }
+    if (ctl_args && !strcmp(ctl_args, "status")) {
+        pr_info("kdbg: stopped=%d cpu=%d sw_bp=%d\n",
+                g_stopped, g_stopped_cpu, g_num_sw_bp);
     }
     return 0;
 }
