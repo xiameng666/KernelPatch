@@ -50,6 +50,9 @@
 /* prctl syscall number on ARM64 */
 #define PRCTL_NR  167
 
+/* kdbg 自定义 BRK 立即数 (用于软件断点, 不与内核冲突) */
+#define KDBG_BRK_IMM  0xDB0
+
 /* ========== 调试事件类型 ========== */
 enum kdbg_event_type {
     KDBG_EVT_NONE       = 0,

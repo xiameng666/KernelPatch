@@ -21,8 +21,6 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/sched.h>
-#include <linux/pid.h>
 #include <asm/ptrace.h>
 #include <asm/current.h>
 #include <hook.h>
@@ -32,6 +30,17 @@
 #include <stdint.h>
 
 #include "kdbg.h"
+
+/* pid_type 枚举 (KPM 不能使用 KP core 的 kfunc, 需自行定义) */
+enum pid_type {
+    PIDTYPE_PID,
+    PIDTYPE_TGID,
+    PIDTYPE_PGID,
+    PIDTYPE_SID,
+    PIDTYPE_MAX,
+};
+struct pid_namespace;
+typedef int pid_t;
 
 KPM_NAME("kdbg");
 KPM_VERSION("1.0.0");
@@ -49,15 +58,17 @@ static int (*kfn_copy_from_kernel_nofault)(void *dst, const void *src,
 static int (*kfn_copy_to_kernel_nofault)(void *dst, const void *src,
                                           unsigned long size);
 
-/* 用于 R3 ↔ R0 数据交换 */
-static int (*kfn_copy_to_user)(void *to, const void *from, unsigned long n);
-static int (*kfn_copy_from_user)(void *to, const void *from, unsigned long n);
+/* 用于 R3 ↔ R0 数据交换 (compat_strncpy_from_user 遇 0x00 截断, 不能用于结构体!) */
+static unsigned long (*kfn__copy_from_user)(void *to, const void __user *from, unsigned long n);
 
 /* 信号: send_sig(int sig, struct task_struct *p, int priv) — 3 个参数 */
 static int (*kfn_send_sig)(int sig, void *p, int priv);
 static char *(*kfn_d_path)(const void *path, char *buf, int buflen);
 static void *(*kfn_fget)(unsigned int fd);
 static void (*kfn_fput)(void *file);
+
+/* PID 获取: 通过 kallsyms 解析, 替代硬编码 task_struct 偏移 */
+static pid_t (*kfn___task_pid_nr_ns)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns);
 
 /* ========== 软件断点管理 ========== */
 
@@ -351,6 +362,8 @@ static void kdbg_wait_for_r3(struct pt_regs *regs)
  * 函数原型: void do_debug_exception(unsigned long addr, unsigned int esr,
  *                                     struct pt_regs *regs)
  */
+#define ESR_BRK64_ISS_COMMENT_MASK  0xFFFFUL
+
 static void before_do_debug_exception(hook_fargs3_t *args, void *udata)
 {
     unsigned long addr = (unsigned long)args->arg0;
@@ -358,24 +371,39 @@ static void before_do_debug_exception(hook_fargs3_t *args, void *udata)
     struct pt_regs *regs = (struct pt_regs *)args->arg2;
     unsigned int ec = ESR_ELx_EC(esr);
 
+    /*
+     * 安全守卫: 没有设置目标进程时, 不拦截任何调试异常
+     * 否则内核自身的 BRK (BUG/WARN/KASAN/kprobes) 会进入
+     * kdbg_wait_for_r3() 无限自旋 → CPU 死锁 → 黑屏
+     */
+    if (!g_target_pid)
+        return;
+
     /* PID 过滤: 仅处理目标进程的调试异常 */
-    if (g_target_pid) {
+    {
         struct task_struct *tsk = (struct task_struct *)current;
-        pid_t pid = __task_pid_nr_ns(tsk, PIDTYPE_PID, NULL);
-        pid_t tgid = __task_pid_nr_ns(tsk, PIDTYPE_TGID, NULL);
+        pid_t pid = kfn___task_pid_nr_ns ? kfn___task_pid_nr_ns(tsk, PIDTYPE_PID, 0) : -1;
+        pid_t tgid = kfn___task_pid_nr_ns ? kfn___task_pid_nr_ns(tsk, PIDTYPE_TGID, 0) : -1;
         if (pid != g_target_pid && tgid != g_target_pid)
             return;
     }
 
     switch (ec) {
-    case ESR_EC_BRK64:
-        /* BRK 软件断点 */
+    case ESR_EC_BRK64: {
+        /*
+         * 只拦截 kdbg 自己的 BRK 立即数 (KDBG_BRK_IMM)
+         * 放行内核的 BRK: 0x800(BUG/WARN) 0x004(kprobes) 0x900+(KASAN)
+         */
+        uint16_t brk_imm = (uint16_t)(esr & ESR_BRK64_ISS_COMMENT_MASK);
+        if (brk_imm != KDBG_BRK_IMM)
+            break;  /* 不是我们的 BRK, 放行给原始 handler */
+
         pr_info("kdbg: BRK exception at %llx ESR=%x\n", regs->pc, esr);
         fill_event(&g_pending_event, KDBG_EVT_BREAKPOINT, 0, regs);
         kdbg_wait_for_r3(regs);
-        /* 跳过原始 handler, 我们已处理 */
         args->skip_origin = 1;
         break;
+    }
 
     case ESR_EC_SOFTSTP_CUR:
         /* 单步异常 */
@@ -447,7 +475,7 @@ static void before_mmap(hook_fargs6_t *args, void *udata)
 
     /* 检查是否是目标进程 */
     struct task_struct *tsk = (struct task_struct *)current;
-    pid_t tgid = __task_pid_nr_ns(tsk, PIDTYPE_TGID, NULL);
+    pid_t tgid = kfn___task_pid_nr_ns ? kfn___task_pid_nr_ns(tsk, PIDTYPE_TGID, 0) : -1;
     if (tgid != g_target_pid)
         return;
 
@@ -538,7 +566,7 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
                                       TASK_COMM_LEN - 1) > 0) {
             comm[TASK_COMM_LEN - 1] = 0;
             struct task_struct *tsk = (struct task_struct *)current;
-            pid_t tgid = __task_pid_nr_ns(tsk, PIDTYPE_TGID, NULL);
+            pid_t tgid = kfn___task_pid_nr_ns ? kfn___task_pid_nr_ns(tsk, PIDTYPE_TGID, 0) : -1;
 
             /* 调试日志: 打印每个 PR_SET_NAME (仅监控期间) */
             pr_info("kdbg: PR_SET_NAME pid=%d comm='%s' target='%s' match=%d\n",
@@ -642,8 +670,8 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
     case KDBG_PRCTL_READ_MEM: {
         /* arg2 = &kdbg_mem_args (用户态指针) */
         struct kdbg_mem_args ma;
-        if (compat_strncpy_from_user((char *)&ma, (const char *)uarg2,
-                                      sizeof(ma)) < 0) {
+        if (!kfn__copy_from_user || kfn__copy_from_user(&ma, (void *)uarg2,
+                                      sizeof(ma))) {
             args->ret = -1; return;
         }
         if (ma.len > KDBG_MEM_MAX) ma.len = KDBG_MEM_MAX;
@@ -661,14 +689,14 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
 
     case KDBG_PRCTL_WRITE_MEM: {
         struct kdbg_mem_args ma;
-        if (compat_strncpy_from_user((char *)&ma, (const char *)uarg2,
-                                      sizeof(ma)) < 0) {
+        if (!kfn__copy_from_user || kfn__copy_from_user(&ma, (void *)uarg2,
+                                      sizeof(ma))) {
             args->ret = -1; return;
         }
         if (ma.len > KDBG_MEM_MAX) ma.len = KDBG_MEM_MAX;
 
         char tmp[KDBG_MEM_MAX];
-        if (compat_strncpy_from_user(tmp, (const char *)ma.ubuf, ma.len) < 0) {
+        if (kfn__copy_from_user(tmp, (void *)ma.ubuf, ma.len)) {
             args->ret = -1; return;
         }
 
@@ -701,8 +729,8 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
             args->ret = -1; return;
         }
         struct kdbg_regs kr;
-        if (compat_strncpy_from_user((char *)&kr, (const char *)uarg2,
-                                      sizeof(kr)) < 0) {
+        if (!kfn__copy_from_user || kfn__copy_from_user(&kr, (void *)uarg2,
+                                      sizeof(kr))) {
             args->ret = -1; return;
         }
         for (int i = 0; i < 31; i++)
@@ -785,8 +813,8 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
     case KDBG_PRCTL_MMAP_WATCH: {
         /* arg2 = &kdbg_mmap_args (用户态) */
         struct kdbg_mmap_args ma;
-        if (compat_strncpy_from_user((char *)&ma, (const char *)uarg2,
-                                      sizeof(ma)) < 0) {
+        if (!kfn__copy_from_user || kfn__copy_from_user(&ma, (void *)uarg2,
+                                      sizeof(ma))) {
             args->ret = -1; return;
         }
         g_target_pid = ma.pid;
@@ -892,9 +920,17 @@ static long kdbg_init(const char *kpm_args, const char *event, void *__user rese
         kallsyms_lookup_name("fget");
     kfn_fput = (typeof(kfn_fput))
         kallsyms_lookup_name("fput");
+    kfn___task_pid_nr_ns = (typeof(kfn___task_pid_nr_ns))
+        kallsyms_lookup_name("__task_pid_nr_ns");
+    kfn__copy_from_user = (typeof(kfn__copy_from_user))
+        kallsyms_lookup_name("_copy_from_user");
 
     if (!kfn_send_sig)
         pr_warn("kdbg: send_sig not found, spawn freeze won't work\n");
+    if (!kfn___task_pid_nr_ns)
+        pr_warn("kdbg: __task_pid_nr_ns not found, PID filtering won't work\n");
+    if (!kfn__copy_from_user)
+        pr_warn("kdbg: _copy_from_user not found, struct prctl commands broken\n");
     if (!kfn_d_path || !kfn_fget || !kfn_fput)
         pr_warn("kdbg: d_path/fget/fput not found, mmap SO detection won't work\n");
 
