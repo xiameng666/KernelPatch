@@ -78,6 +78,7 @@ struct page_info {
     uint64_t shadow_page_va;  /* 影子页内核虚拟地址 */
     uint32_t state;           /* STATE_NONE / ORIG_R / SHADOW_X */
     uint32_t patch_count;     /* 本页上的活跃 patch 数量 */
+    volatile uint32_t transitioning; /* 1 = BBM + state 切换进行中 */
 };
 
 /*
@@ -145,6 +146,7 @@ static unsigned long wx_fault_exec_count;
 static unsigned long wx_fault_el1_skip_count;
 static unsigned long wx_fault_total_count;  /* 所有进入 handler 的 fault */
 static unsigned long wx_fault_reentry_count; /* 重入拦截计数 */
+static unsigned long wx_fault_trans_retry_count; /* BBM transitioning 重试计数 */
 static uint64_t global_lock;
 
 /* ========== Per-CPU 重入保护 ========== */
@@ -598,10 +600,18 @@ static int wxjump_handle_read_fault(void *mm, unsigned long addr)
         return -1;
     }
 
-    /* 切到 orig page: UXN + 只读 (可读不可执行) */
+    /* 切到 orig page: UXN + 只读 (可读不可执行)
+     * Bug 2 fix: 设置 transitioning 标志覆盖整个 PTE切换+state更新窗口。
+     * 其他 CPU 的 fault handler 看到 transitioning=1 时会重试指令，
+     * 避免看到不一致的 PTE/state 后落入内核产生 SIGSEGV。
+     * 理论依据: Linux vmemmap HVO patch "lock + retry" 模式 */
     wx_fault_read_count++;
+    pi->transitioning = 1;
+    asm volatile("dmb ish" ::: "memory");  /* 确保 transitioning 对其他 CPU 可见 */
+
     ret = wxjump_switch_mapping(vma, page_addr, local_orig_pfn, PTE_UXN_USER_RO);
     if (ret) {
+        pi->transitioning = 0;
         wxjump_put_region(region);
         return -1;
     }
@@ -609,6 +619,9 @@ static int wxjump_handle_read_fault(void *mm, unsigned long addr)
     wx_spin_lock();
     pi->state = STATE_ORIG_R;
     wx_spin_unlock();
+
+    asm volatile("dmb ish" ::: "memory");  /* 确保 state 更新对其他 CPU 可见后再清除标志 */
+    pi->transitioning = 0;
 
     wxjump_put_region(region);
     return 0;
@@ -666,9 +679,14 @@ static int wxjump_handle_exec_fault(void *mm, unsigned long addr)
     if (local_shadow_page_va)
         wx_flush_dcache_va(local_shadow_page_va, WX_PAGE_SIZE);
 
-    /* 切到 shadow page (--x, execute-only) */
+    /* 切到 shadow page (--x, execute-only)
+     * Bug 2 fix: 同 read_fault，用 transitioning 覆盖整个切换窗口 */
+    pi->transitioning = 1;
+    asm volatile("dmb ish" ::: "memory");
+
     ret = wxjump_switch_mapping(vma, page_addr, local_shadow_pfn, 0);
     if (ret) {
+        pi->transitioning = 0;
         wxjump_put_region(region);
         return -1;
     }
@@ -678,6 +696,9 @@ static int wxjump_handle_exec_fault(void *mm, unsigned long addr)
     wx_spin_lock();
     pi->state = STATE_SHADOW_X;
     wx_spin_unlock();
+
+    asm volatile("dmb ish" ::: "memory");
+    pi->transitioning = 0;
 
     wx_fault_exec_count++;
     wxjump_put_region(region);
@@ -712,36 +733,95 @@ static void do_page_fault_before(hook_fargs3_t *fargs, void *udata)
         return;
     }
 
-    /* 只处理 permission fault (DFSC[5:2]=0b0011) */
-    if ((esr & 0x3C) != 0x0C) {
-        kfn_mmput(mm);
-        wx_in_fault_handler[cpu] = 0;
-        return;
-    }
-
-    struct wx_region *region = wxjump_find_region(mm, far);
-    if (!region) {
-        kfn_mmput(mm);
-        wx_in_fault_handler[cpu] = 0;
-        return;
-    }
-    wxjump_put_region(region);
-
     unsigned long ec = (esr >> 26) & 0x3FUL;
     unsigned long dfsc = esr & 0x3FUL;
+    unsigned long dfsc_class = esr & 0x3C; /* DFSC[5:2] */
 
-    if (cnt <= 5)
-        pr_info("wxjump: fault #%lu EC=0x%lx DFSC=0x%lx matched_region FAR=%lx\n",
-                cnt, ec, dfsc, far);
+    /* ===== Bug 1+2 fix: 拦截 BBM transitioning 期间的璯态 fault =====
+     *
+     * ARM ARM D5.10.1 要求 Break-Before-Make: PTE=0 → TLBI → 写新 PTE。
+     * PTE=0 期间其他 CPU 访问产生 Translation Fault (DFSC 0x04-0x07)。
+     * 同时，PTE 切换完成但 state 未更新期间，可能产生 Permission Fault。
+     * 两种情况都是瞬态的，重试指令即可。
+     *
+     * 参考: Linux vmemmap HVO patch (spinics.net) 使用相同的
+     * "lock + retry" 模式处理 BBM 期间的 translation fault。
+     *
+     * 检查条件:
+     * 1. 必须是 EL0 fault (EC=0x20 insn abort 或 EC=0x24 data abort)
+     * 2. fault 地址属于 wxjump 管辖的 region
+     * 3. 对应 page_info 正在 transitioning
+     * 满足时跳过内核 handler，用户态重试指令
+     */
+    if (dfsc_class != 0x0C && (ec == 0x24 || ec == 0x20)) {
+        /* 非 Permission Fault 且为 EL0 abort — 检查是否为 BBM 导致 */
+        if (dfsc >= 0x04 && dfsc <= 0x07) {
+            /* Translation Fault (level 0-3) */
+            struct wx_region *region = wxjump_find_region(mm, far);
+            if (region) {
+                unsigned long page_addr = far & PAGE_MASK_4K;
+                int idx = wxjump_page_index(region, page_addr);
+                if (idx >= 0 && idx < region->nr_pages) {
+                    struct page_info *pi = &region->pages[idx];
+                    if (pi->transitioning) {
+                        /* BBM 进行中 — 重试指令 */
+                        wx_fault_trans_retry_count++;
+                        wxjump_put_region(region);
+                        kfn_mmput(mm);
+                        wx_in_fault_handler[cpu] = 0;
+                        fargs->skip_origin = 1;
+                        fargs->ret = 0;
+                        return;
+                    }
+                }
+                wxjump_put_region(region);
+            }
+        }
+        /* 非 wxjump BBM 导致的 translation/other fault → 交给内核 */
+        kfn_mmput(mm);
+        wx_in_fault_handler[cpu] = 0;
+        return;
+    }
 
-    /* Only handle EL0 faults. EL1 faults (EC=0x21/0x25) are from kernel
-     * (e.g. EPAN blocking EL1 access to UXN=0 pages) -> let kernel handle */
-    if (ec != 0x24 && ec != 0x20) {
+    /* Permission Fault (DFSC[5:2]=0b0011) — 也检查 transitioning */
+    if (dfsc_class == 0x0C && (ec == 0x24 || ec == 0x20)) {
+        struct wx_region *region = wxjump_find_region(mm, far);
+        if (region) {
+            unsigned long page_addr = far & PAGE_MASK_4K;
+            int idx = wxjump_page_index(region, page_addr);
+            if (idx >= 0 && idx < region->nr_pages) {
+                struct page_info *pi = &region->pages[idx];
+                if (pi->transitioning) {
+                    /* PTE 已切换但 state 未更新 — 重试指令 */
+                    wx_fault_trans_retry_count++;
+                    wxjump_put_region(region);
+                    kfn_mmput(mm);
+                    wx_in_fault_handler[cpu] = 0;
+                    fargs->skip_origin = 1;
+                    fargs->ret = 0;
+                    return;
+                }
+            }
+            wxjump_put_region(region);
+        } else {
+            /* 不属于 wxjump 管辖的 permission fault → 交给内核 */
+            kfn_mmput(mm);
+            wx_in_fault_handler[cpu] = 0;
+            return;
+        }
+    } else {
+        /* 非 EL0 fault (EC 不是 0x20/0x24) → 交给内核 */
         wx_fault_el1_skip_count++;
         kfn_mmput(mm);
         wx_in_fault_handler[cpu] = 0;
         return;
     }
+
+    /* ===== 以下为 Permission Fault 正常处理路径 ===== */
+
+    if (cnt <= 5)
+        pr_info("wxjump: fault #%lu EC=0x%lx DFSC=0x%lx FAR=%lx\n",
+                cnt, ec, dfsc, far);
 
     /* Acquire mmap_lock before VMA tree traversal in handlers.
      * Use trylock: we are in fault context (before kernel's do_page_fault
@@ -1736,9 +1816,9 @@ static long wxjump_exit(void *reserved)
 static long wxjump_control(const char *args, char *__user out_msg, int outlen)
 {
     pr_info("wxjump: control: %s\n", args ? args : "(null)");
-    pr_info("wxjump: stats: total=%lu read=%lu exec=%lu el1_skip=%lu reentry=%lu\n",
+    pr_info("wxjump: stats: total=%lu read=%lu exec=%lu el1_skip=%lu reentry=%lu trans_retry=%lu\n",
             wx_fault_total_count, wx_fault_read_count, wx_fault_exec_count,
-            wx_fault_el1_skip_count, wx_fault_reentry_count);
+            wx_fault_el1_skip_count, wx_fault_reentry_count, wx_fault_trans_retry_count);
     return 0;
 }
 
