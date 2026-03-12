@@ -357,7 +357,7 @@ static inline uint64_t make_pte(uint64_t pfn, uint64_t flags)
 {
     return (pfn << 12) | flags | PTE_BASE_FLAGS;
 }
-
+ 
 static int wxjump_switch_mapping(void *vma, unsigned long addr,
                                   uint64_t pfn, uint64_t extra_flags)
 {
@@ -1435,14 +1435,20 @@ static int resolve_symbols(void)
 
     /* Page fault handler */
     kfn_do_page_fault = (void *)kallsyms_lookup_name("do_page_fault");
-    if (!kfn_do_page_fault)
+    if (kfn_do_page_fault) {
+        pr_info("wxjump: fault hook target: do_page_fault at %px\n", kfn_do_page_fault);
+    } else {
         kfn_do_page_fault = (void *)kallsyms_lookup_name("__do_page_fault");
-    if (!kfn_do_page_fault)
-        kfn_do_page_fault = (void *)kallsyms_lookup_name("do_mem_abort");
-    if (kfn_do_page_fault)
-        pr_info("wxjump: page fault handler at %px\n", kfn_do_page_fault);
-    else
-        pr_warn("wxjump: page fault handler not found, CRC hiding disabled\n");
+        if (kfn_do_page_fault) {
+            pr_info("wxjump: fault hook target: __do_page_fault at %px\n", kfn_do_page_fault);
+        } else {
+            kfn_do_page_fault = (void *)kallsyms_lookup_name("do_mem_abort");
+            if (kfn_do_page_fault)
+                pr_warn("wxjump: fault hook target: do_mem_abort at %px (FALLBACK - will receive EL1 faults)\n", kfn_do_page_fault);
+            else
+                pr_warn("wxjump: page fault handler not found, CRC hiding disabled\n");
+        }
+    }
 
     pr_info("wxjump:   kzalloc          = %px\n", kfn_kzalloc);
     pr_info("wxjump:   kcalloc          = %px\n", kfn_kcalloc);

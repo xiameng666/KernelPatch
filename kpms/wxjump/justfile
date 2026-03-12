@@ -7,4 +7,4 @@ build:
     make -C "{{justfile_directory()}}" TARGET_COMPILE={{TC}} KP_DIR={{KP}} clean all
 
 push:
-    MSYS_NO_PATHCONV=1 adb push "{{justfile_directory()}}/wxjump.kpm" /sdcard/Download/
+    adb push "{{justfile_directory()}}/wxjump.kpm" //sdcard/Download/
