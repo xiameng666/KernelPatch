@@ -101,7 +101,7 @@ static int g_target_pid = 0;
 
 /* ========== Spawn 监控状态 ========== */
 
-static char g_spawn_target_comm[16];        /* 目标包名 */
+static char g_spawn_target_comm[256];       /* 目标包名 (完整, 不截断) */
 static volatile int g_spawn_watching = 0;   /* 是否在监控 */
 static volatile int g_spawn_found = 0;      /* 是否已检测到 */
 static int g_spawn_pid = 0;                 /* 检测到的 PID */
@@ -576,7 +576,7 @@ static void before_set_task_comm(hook_fargs3_t *args, void *udata)
     pr_info("kdbg: set_task_comm pid=%d name='%s' target='%s'\n",
             tgid, name, g_spawn_target_comm);
 
-    if (!g_spawn_found && strstr(name, g_spawn_target_comm)) {
+    if (!g_spawn_found && strstr(g_spawn_target_comm, name)) {
         g_spawn_pid = tgid;
         g_spawn_found = 1;
         g_spawn_watching = 0;
