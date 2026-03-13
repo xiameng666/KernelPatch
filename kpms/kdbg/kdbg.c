@@ -802,19 +802,26 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
     }
 
     case KDBG_PRCTL_WAIT_SPAWN: {
-        /* 自旋等待目标进程出现 */
-        while (!g_spawn_found) {
+        /* 自旋等待目标进程出现, 同时检查 watching 标志以支持取消 */
+        while (!g_spawn_found && g_spawn_watching) {
             asm volatile("yield");
         }
-        args->ret = g_spawn_pid;
+        if (g_spawn_found) {
+            args->ret = g_spawn_pid;
+        } else {
+            /* 被 CANCEL_SPAWN 取消 */
+            args->ret = -1;
+        }
         return;
     }
 
     case KDBG_PRCTL_CANCEL_SPAWN: {
-        g_spawn_watching = 0;
+        g_spawn_watching = 0;  /* 先清 watching, 让 WAIT_SPAWN 自旋退出 */
         g_spawn_found = 0;
         g_spawn_pid = 0;
-        pr_info("kdbg: spawn watch cancelled\n");
+        /* 同时取消 mmap 监控 (解除 WAIT_MMAP 自旋) */
+        g_mmap_watching = 0;
+        pr_info("kdbg: spawn/mmap watch cancelled\n");
         args->ret = 0;
         return;
     }
@@ -848,8 +855,13 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
 
     case KDBG_PRCTL_WAIT_MMAP: {
         /* 自旋等待 SO 加载, arg2 = &kdbg_mmap_result (用户态) */
-        while (!g_mmap_so_found) {
+        while (!g_mmap_so_found && g_mmap_watching) {
             asm volatile("yield");
+        }
+        if (!g_mmap_so_found) {
+            /* 被取消 */
+            args->ret = -1;
+            return;
         }
         struct kdbg_mmap_result mr;
         mr.base = g_mmap_so_base;
