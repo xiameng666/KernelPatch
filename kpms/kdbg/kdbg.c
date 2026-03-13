@@ -70,6 +70,9 @@ static void (*kfn_fput)(void *file);
 /* PID 获取: 通过 kallsyms 解析, 替代硬编码 task_struct 偏移 */
 static pid_t (*kfn___task_pid_nr_ns)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns);
 
+/* comm 修改: 所有路径 (prctl PR_SET_NAME / /proc/comm / execve) 最终调用此函数 */
+static void (*kfn___set_task_comm)(struct task_struct *tsk, const char *buf, int exec);
+
 /* ========== 软件断点管理 ========== */
 
 struct sw_bp {
@@ -545,6 +548,48 @@ static void after_mmap(hook_fargs6_t *args, void *udata)
             g_mmap_so_base, g_mmap_so_size);
 }
 
+/* ========== __set_task_comm Hook (Spawn 进程名检测) ========== */
+
+/*
+ * void __set_task_comm(struct task_struct *tsk, const char *buf, bool exec)
+ *
+ * 所有 comm 修改路径最终调用此函数:
+ *   - prctl(PR_SET_NAME) → set_task_comm → __set_task_comm(tsk, buf, false)
+ *   - execve → setup_new_exec → __set_task_comm(tsk, basename, true)
+ *   - /proc/self/task/<tid>/comm 写入 → __set_task_comm(tsk, buf, false)
+ *
+ * buf 已在内核内存中, 无需 compat_strncpy_from_user
+ */
+static void before_set_task_comm(hook_fargs3_t *args, void *udata)
+{
+    if (!g_spawn_watching)
+        return;
+
+    struct task_struct *tsk = (struct task_struct *)args->arg0;
+    const char *name = (const char *)args->arg1;
+
+    if (!name || !tsk)
+        return;
+
+    /* 调试日志: 打印每个 comm 变更 (仅监控期间) */
+    pid_t tgid = kfn___task_pid_nr_ns ? kfn___task_pid_nr_ns(tsk, PIDTYPE_TGID, 0) : -1;
+    pr_info("kdbg: set_task_comm pid=%d name='%s' target='%s'\n",
+            tgid, name, g_spawn_target_comm);
+
+    if (!g_spawn_found && strstr(name, g_spawn_target_comm)) {
+        g_spawn_pid = tgid;
+        g_spawn_found = 1;
+        g_spawn_watching = 0;
+
+        /* SIGSTOP 冻结进程 */
+        if (kfn_send_sig)
+            kfn_send_sig(19 /* SIGSTOP */, tsk, 1 /* priv */);
+
+        pr_info("kdbg: spawn detected: '%s' pid=%d, frozen\n",
+                name, g_spawn_pid);
+    }
+}
+
 /* ========== prctl Syscall Hook (R3 通信入口) ========== */
 
 static void before_prctl(hook_fargs4_t *args, void *udata)
@@ -554,40 +599,6 @@ static void before_prctl(hook_fargs4_t *args, void *udata)
     long uarg3  = (long)syscall_argn(args, 2);
     /* long uarg4 = (long)syscall_argn(args, 3); */
     /* long uarg5 = (long)syscall_argn(args, 4); */
-
-    /*
-     * 拦截 PR_SET_NAME (option=15) 用于 spawn 监控
-     * 只在 g_spawn_watching=1 时才处理, 避免对所有 PR_SET_NAME 造成开销
-     * 不设置 skip_origin, 让原始 prctl 继续执行
-     */
-    if (option == 15 && g_spawn_watching) {
-        char comm[TASK_COMM_LEN];
-        if (compat_strncpy_from_user(comm, (const char *)uarg2,
-                                      TASK_COMM_LEN - 1) > 0) {
-            comm[TASK_COMM_LEN - 1] = 0;
-            struct task_struct *tsk = (struct task_struct *)current;
-            pid_t tgid = kfn___task_pid_nr_ns ? kfn___task_pid_nr_ns(tsk, PIDTYPE_TGID, 0) : -1;
-
-            /* 调试日志: 打印每个 PR_SET_NAME (仅监控期间) */
-            pr_info("kdbg: PR_SET_NAME pid=%d comm='%s' target='%s' match=%d\n",
-                    tgid, comm, g_spawn_target_comm,
-                    strstr(comm, g_spawn_target_comm) ? 1 : 0);
-
-            if (!g_spawn_found && strstr(comm, g_spawn_target_comm)) {
-                g_spawn_pid = tgid;
-                g_spawn_found = 1;
-                g_spawn_watching = 0;
-
-                /* SIGSTOP 冻结进程 */
-                if (kfn_send_sig)
-                    kfn_send_sig(19 /* SIGSTOP */, tsk, 1 /* priv */);
-
-                pr_info("kdbg: spawn detected: '%s' pid=%d, frozen\n",
-                        comm, g_spawn_pid);
-            }
-        }
-        return;  /* 不 skip, 让原始 PR_SET_NAME 继续 */
-    }
 
     /* 快速过滤: 不是我们的命令码就放行 */
     if ((option & 0xFFFFFF00) != 0x4B444200)
@@ -924,6 +935,8 @@ static long kdbg_init(const char *kpm_args, const char *event, void *__user rese
         kallsyms_lookup_name("__task_pid_nr_ns");
     kfn__copy_from_user = (typeof(kfn__copy_from_user))
         kallsyms_lookup_name("_copy_from_user");
+    kfn___set_task_comm = (typeof(kfn___set_task_comm))
+        kallsyms_lookup_name("__set_task_comm");
 
     if (!kfn_send_sig)
         pr_warn("kdbg: send_sig not found, spawn freeze won't work\n");
@@ -931,6 +944,8 @@ static long kdbg_init(const char *kpm_args, const char *event, void *__user rese
         pr_warn("kdbg: __task_pid_nr_ns not found, PID filtering won't work\n");
     if (!kfn__copy_from_user)
         pr_warn("kdbg: _copy_from_user not found, struct prctl commands broken\n");
+    if (!kfn___set_task_comm)
+        pr_warn("kdbg: __set_task_comm not found, spawn detection won't work\n");
     if (!kfn_d_path || !kfn_fget || !kfn_fput)
         pr_warn("kdbg: d_path/fget/fput not found, mmap SO detection won't work\n");
 
@@ -965,6 +980,21 @@ static long kdbg_init(const char *kpm_args, const char *event, void *__user rese
         /* 非致命, 继续 */
     } else {
         pr_info("kdbg: mmap hooked, SO load detection ready\n");
+    }
+
+    /* Hook __set_task_comm 用于 spawn 进程名检测 (3 个参数) */
+    if (kfn___set_task_comm) {
+        err = hook_wrap3(
+            (void *)kfn___set_task_comm,
+            (hook_chain3_callback)before_set_task_comm,
+            0,  /* no after hook */
+            0   /* no udata */
+        );
+        if (err) {
+            pr_warn("kdbg: hook __set_task_comm failed: %d, spawn detection disabled\n", err);
+        } else {
+            pr_info("kdbg: __set_task_comm hooked, spawn detection ready\n");
+        }
     }
 
     /* 初始化断点表 */
@@ -1014,6 +1044,9 @@ static long kdbg_exit(void *__user reserved)
     }
 
     /* 卸载 hook */
+    if (kfn___set_task_comm)
+        hook_unwrap((void *)kfn___set_task_comm,
+                    (void *)before_set_task_comm, 0);
     unhook_syscalln(222, (hook_chain6_callback)before_mmap,
                     (hook_chain6_callback)after_mmap);
     unhook_syscalln(PRCTL_NR, before_prctl, 0);
