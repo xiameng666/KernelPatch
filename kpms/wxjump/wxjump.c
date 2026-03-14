@@ -46,6 +46,7 @@ KPM_DESCRIPTION("W^X Shadow Page Jump Hook - Zero kernel overhead inline hook wi
 /* prctl 命令码 (延续 wxshadow 0x575858xx 编号) */
 #define WXJUMP_PRCTL_PATCH   0x57585804  /* 写入 shadow page */
 #define WXJUMP_PRCTL_RELEASE 0x57585805  /* 释放 shadow page */
+#define WXJUMP_PRCTL_QUERY   0x57585806  /* 查询 KPM 是否可用 (返回 0 表示可用) */
 
 #define PRCTL_NR             167      /* ARM64 prctl 系统调用号 */
 #define WX_PAGE_SIZE         4096
@@ -1186,6 +1187,13 @@ static void prctl_before(hook_fargs5_t *fargs, void *udata)
     uint64_t option = args[0];
     void *mm;
     int ret;
+
+    /* QUERY: 简单返回 0 表示 wxjump KPM 已加载可用 */
+    if ((uint32_t)option == WXJUMP_PRCTL_QUERY) {
+        fargs->skip_origin = 1;
+        fargs->ret = 0;
+        return;
+    }
 
     if ((uint32_t)option == WXJUMP_PRCTL_PATCH) {
         unsigned long page_addr = (unsigned long)args[1];

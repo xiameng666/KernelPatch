@@ -12,10 +12,10 @@ LD = $(TARGET_COMPILE)ld
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
-# Also include the local directory for hide_maps.h etc.
+# Also include the local directory for headers
 INCLUDE_FLAGS += -I.
 
-objs := xiam_tools.o hide_maps.o
+objs := xiam_tools.o xiam_utils.o hide_maps.o hide_apatch.o hide_mount.o hide_misc.o hide_net.o
 
 all: xiam-tools.kpm
 

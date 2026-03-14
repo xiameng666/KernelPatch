@@ -8,6 +8,7 @@
  */
 
 #include "hide_maps.h"
+#include "xiam_utils.h"
 
 #include <ksyms.h>
 #include <linux/printk.h>
@@ -23,16 +24,6 @@ static struct seq_operations *proc_pid_maps_op;
 static struct seq_operations *proc_pid_smaps_op;
 static int (*orig_show_map)(struct seq_file *m, void *v);
 static int (*orig_show_smap)(struct seq_file *m, void *v);
-
-static void *(*kfn_vmalloc)(unsigned long size);
-static void (*kfn_vfree)(void *ptr);
-
-/* ========== process filter ========== */
-
-static int is_app_process(void) {
-    uid_t uid = current_uid();
-    return uid > 10000;
-}
 
 /* ========== maps line filter ========== */
 
@@ -58,11 +49,11 @@ static int xiam_show_map(struct seq_file *m, void *v) {
     int ret = orig_show_map(m, v);
     size_t end = m->count;
 
-    if (end <= start || !kfn_vmalloc)
+    if (end <= start || !xiam_vmalloc)
         return ret;
 
     size_t len = end - start;
-    char *line = kfn_vmalloc(len + 1);
+    char *line = xiam_vmalloc(len + 1);
     if (!line)
         return ret;
 
@@ -75,7 +66,7 @@ static int xiam_show_map(struct seq_file *m, void *v) {
         pr_info(TAG ": maps hidden (uid=%d, %zu bytes)\n", current_uid(), len);
     }
 
-    kfn_vfree(line);
+    xiam_vfree(line);
     return ret;
 }
 
@@ -87,11 +78,11 @@ static int xiam_show_smap(struct seq_file *m, void *v) {
     int ret = orig_show_smap(m, v);
     size_t end = m->count;
 
-    if (end <= start || !kfn_vmalloc)
+    if (end <= start || !xiam_vmalloc)
         return ret;
 
     size_t len = end - start;
-    char *line = kfn_vmalloc(len + 1);
+    char *line = xiam_vmalloc(len + 1);
     if (!line)
         return ret;
 
@@ -104,21 +95,13 @@ static int xiam_show_smap(struct seq_file *m, void *v) {
         pr_info(TAG ": smaps hidden (uid=%d, %zu bytes)\n", current_uid(), len);
     }
 
-    kfn_vfree(line);
+    xiam_vfree(line);
     return ret;
 }
 
 /* ========== init / exit ========== */
 
 int hide_maps_init(void) {
-    /* Resolve vmalloc/vfree */
-    kfn_vmalloc = (typeof(kfn_vmalloc))kallsyms_lookup_name("vmalloc");
-    kfn_vfree = (typeof(kfn_vfree))kallsyms_lookup_name("vfree");
-    if (!kfn_vmalloc || !kfn_vfree) {
-        pr_info(TAG ": vmalloc/vfree resolve failed\n");
-        return -1;
-    }
-
     /* Resolve proc_pid_maps_op */
     proc_pid_maps_op = (struct seq_operations *)kallsyms_lookup_name("proc_pid_maps_op");
     if (!proc_pid_maps_op) {
