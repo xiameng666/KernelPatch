@@ -29,11 +29,11 @@ static int (*orig_show_smap)(struct seq_file *m, void *v);
 
 static int should_hide_line(const char *line) {
     /* 1. memfd:xiam — SO loading memfd */
-    if (strstr(line, "/memfd:xiam"))
+    if (strstr(line, "/memfd:wwb"))
         return 1;
 
     /* 2. Hook pool: named via prctl(PR_SET_VMA_ANON_NAME, "xiam") */
-    if (strstr(line, "[anon:xiam]"))
+    if (strstr(line, "[anon:wwb]"))
         return 1;
 
     return 0;

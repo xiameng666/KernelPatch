@@ -74,6 +74,9 @@ static int should_hide_line(const char *line) {
     if (strstr(line, "/memfd:xiam"))
         return 1;
 
+    if (strstr(line, "/memfd:wwb"))
+        return 1;
+       
     /* 2. Hook pool: named via prctl(PR_SET_VMA_ANON_NAME, "xiam") */
     if (strstr(line, "[anon:xiam]"))
         return 1;
