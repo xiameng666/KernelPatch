@@ -1,0 +1,29 @@
+TC := "C:/Users/24151/Documents/GitHub/无痕hook/KernelPatch/arm-gnu-toolchain-15.2.rel1-mingw-w64-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+KP := "C:/Users/24151/Documents/GitHub/无痕hook/KernelPatch"
+KEY := env("SUPERKEY", "xiameng666")
+KPM := "demo-mmap-log"
+
+default: build push load
+
+build:
+    #!/usr/bin/env bash
+    export TMP="$(pwd)"
+    export TEMP="$(pwd)"
+    export TMPDIR="$(pwd)"
+    make -C "{{justfile_directory()}}" TARGET_COMPILE={{TC}} KP_DIR={{KP}} CFLAGS="-fno-builtin -pipe" clean all
+
+push:
+    MSYS_NO_PATHCONV=1 adb push "{{justfile_directory()}}/{{KPM}}.kpm" "/data/local/tmp/{{KPM}}.kpm"
+
+load:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} load /data/local/tmp/{{KPM}}.kpm"
+
+unload:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} unload {{KPM}}"
+
+# 重置日志计数
+reset:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} ctl {{KPM}} reset"
+
+dmesg:
+    adb shell dmesg | grep -i "mmap-log"

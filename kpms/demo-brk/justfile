@@ -1,0 +1,57 @@
+TC := "C:/Users/24151/Documents/GitHub/无痕hook/KernelPatch/arm-gnu-toolchain-15.2.rel1-mingw-w64-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+KP := "C:/Users/24151/Documents/GitHub/无痕hook/KernelPatch"
+KEY := env("SUPERKEY", "xiameng666")
+KPM := "demo-brk"
+
+default: build push
+
+build:
+    #!/usr/bin/env bash
+    export TMP="$(pwd)"
+    export TEMP="$(pwd)"
+    export TMPDIR="$(pwd)"
+    make -C "{{justfile_directory()}}" TARGET_COMPILE={{TC}} KP_DIR={{KP}} CFLAGS="-fno-builtin -pipe" clean all
+
+push:
+    MSYS_NO_PATHCONV=1 adb push "{{justfile_directory()}}/{{KPM}}.kpm" "/sdcard/Download/{{KPM}}.kpm"
+
+# ========== 快捷命令 ==========
+
+# 加载 (SO 名可选)
+load so_name="":
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} load /sdcard/Download/{{KPM}}.kpm {{so_name}}"
+
+# 卸载
+unload:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} unload {{KPM}}"
+
+# 编译+推送+加载
+deploy: build push (load "")
+
+# 放行 spawn 冻结
+release:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} ctl {{KPM}} release"
+
+# 设置断点: just brk 0x7abc123000
+brk addr:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} ctl {{KPM}} 'brk {{addr}}'"
+
+# 继续执行
+cont:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} ctl {{KPM}} cont"
+
+# 查看寄存器
+regs:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} ctl {{KPM}} regs"
+
+# 查看状态
+status:
+    MSYS_NO_PATHCONV=1 adb shell "/data/local/tmp/kpmctl {{KEY}} ctl {{KPM}} status"
+
+# 查看目标进程 maps: just maps 12345 libunixsocketdemo
+maps pid filter="":
+    MSYS_NO_PATHCONV=1 adb shell "cat /proc/{{pid}}/maps" | grep -i "{{filter}}"
+
+# 查看 dmesg (过滤 demo-brk)
+dmesg:
+    adb shell dmesg | grep -i "{{KPM}}"
