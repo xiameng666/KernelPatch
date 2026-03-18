@@ -10,4 +10,4 @@ build:
     make -C "{{justfile_directory()}}" TARGET_COMPILE={{TC}} KP_DIR={{KP}} CFLAGS="-fno-builtin -pipe" clean all
 
 push:
-    MSYS_NO_PATHCONV=1 adb push "{{justfile_directory()}}/demo-spawn.kpm" /sdcard/Download/
+    MSYS_NO_PATHCONV=1 adb push "{{justfile_directory()}}/demo-spawn.kpm" "/sdcard/Download/demo-spawn.kpm"

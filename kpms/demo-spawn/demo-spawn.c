@@ -60,6 +60,7 @@ static char g_target[256];           /* 目标包名 */
 static volatile int g_frozen = 0;    /* 是否已冻结 */
 static int g_frozen_pid = 0;         /* 被冻结的进程 PID */
 static void *g_frozen_task = 0;      /* 被冻结的 task_struct (用于 SIGCONT) */
+static int g_released_pid = 0;       /* 已放行的 PID, 不再重复冻结 */
 
 /* ========== Hook 回调 ========== */
 
@@ -83,31 +84,49 @@ static void before_set_task_comm(hook_fargs3_t *args, void *udata)
     if (!name || !tsk)
         return;
 
-    /* 检查是否包含目标包名 (用 strstr 子串匹配) */
+    /*
+     * 匹配逻辑:
+     *   Android comm 只有 15 字节, 长包名会被截断为后 15 字节.
+     *   例: "com.example.myapp" → comm = "ample.myapp"
+     *   用 strstr 子串匹配: 截断后的 name 仍是完整包名的子串.
+     */
     if (!strstr(g_target, name))
         return;
 
     /* 匹配! 获取 PID */
     pid_t pid = kfn___task_pid_nr_ns ? kfn___task_pid_nr_ns(tsk, PIDTYPE_TGID, 0) : -1;
 
+    /* 已放行的 PID 不再重复冻结 (同一进程会触发多次 __set_task_comm) */
+    if (pid > 0 && pid == g_released_pid)
+        return;
+
     pr_info("demo-spawn: *** TARGET DETECTED ***\n");
     pr_info("demo-spawn:   name = '%s'\n", name);
     pr_info("demo-spawn:   pid  = %d\n", pid);
-
-    /* SIGSTOP (19) 冻结进程 */
-    if (kfn_send_sig) {
-        kfn_send_sig(19, tsk, 1);
-        pr_info("demo-spawn:   SIGSTOP sent → process FROZEN\n");
-    } else {
-        pr_warn("demo-spawn:   send_sig not found, cannot freeze!\n");
-        return;
-    }
 
     g_frozen_pid = pid;
     g_frozen_task = tsk;
     g_frozen = 1;
 
-    pr_info("demo-spawn: use 'ctl release' to SIGCONT and resume\n");
+    /*
+     * 双保险冻结:
+     *   1. SIGSTOP — 冻住整个进程的所有线程 (包括即将创建的新线程)
+     *   2. busy-wait — 卡住当前线程在内核态, 确保不跑任何用户态代码
+     *
+     * release 时: 清 g_frozen (退出自旋) + 发 SIGCONT (解除 SIGSTOP)
+     */
+    if (kfn_send_sig) {
+        kfn_send_sig(19 /* SIGSTOP */, tsk, 1);
+    }
+
+    pr_info("demo-spawn:   FROZEN (SIGSTOP + busy-wait)\n");
+    pr_info("demo-spawn:   use 'ctl release' to resume\n");
+
+    while (g_frozen) {
+        asm volatile("yield");
+    }
+
+    pr_info("demo-spawn:   pid=%d released, returning to userspace\n", pid);
 }
 
 /* ========== KPM 生命周期 ========== */
@@ -179,16 +198,23 @@ static long demo_control(const char *ctl_args, char *__user out_msg, int outlen)
             return 0;
         }
 
-        /* SIGCONT (18) 恢复进程 */
+        pr_info("demo-spawn: releasing pid=%d...\n", g_frozen_pid);
+
+        /* SIGCONT 解除 SIGSTOP (必须在清 g_frozen 之前, task 指针还有效) */
         if (kfn_send_sig && g_frozen_task) {
-            kfn_send_sig(18, g_frozen_task, 1);
-            pr_info("demo-spawn: SIGCONT sent → pid=%d RESUMED\n", g_frozen_pid);
+            kfn_send_sig(18 /* SIGCONT */, g_frozen_task, 1);
         }
 
-        g_frozen = 0;
-        g_frozen_task = 0;
-        g_frozen_pid = 0;
+        /* 记住已放行的 PID, 防止后续 __set_task_comm 再次冻结 */
+        int pid = g_frozen_pid;
+        g_released_pid = pid;
 
+        /* 清标志 → busy-wait 自旋退出 → 进程返回用户态 */
+        g_frozen_pid = 0;
+        g_frozen_task = 0;
+        g_frozen = 0;  /* 最后清, 让自旋退出 */
+
+        pr_info("demo-spawn: pid=%d RESUMED (SIGCONT + unblock)\n", pid);
         pr_info("demo-spawn: listening again for '%s'...\n", g_target);
         return 0;
     }
@@ -206,9 +232,11 @@ static long demo_control(const char *ctl_args, char *__user out_msg, int outlen)
 static long demo_exit(void *__user reserved)
 {
     /* 先放行被冻结的进程 */
-    if (g_frozen && kfn_send_sig && g_frozen_task) {
-        kfn_send_sig(18, g_frozen_task, 1);
+    if (g_frozen) {
         pr_info("demo-spawn: auto-release pid=%d on unload\n", g_frozen_pid);
+        if (kfn_send_sig && g_frozen_task)
+            kfn_send_sig(18, g_frozen_task, 1);
+        g_frozen = 0;
     }
 
     /* 解除 hook */

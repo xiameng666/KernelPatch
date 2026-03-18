@@ -1,0 +1,41 @@
+NDK := "C:/Users/24151/AppData/Local/Android/Sdk/ndk/27.0.12077973"
+CC := NDK + "/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android31-clang"
+KPMCTL := "/data/local/tmp/kpmctl"
+KEY := env("SUPERKEY", "xiameng666")
+
+default: build push
+
+build:
+    {{CC}} -O2 -static -o "{{justfile_directory()}}/kpmctl" "{{justfile_directory()}}/kpmctl.c"
+
+push:
+    MSYS_NO_PATHCONV=1 adb push "{{justfile_directory()}}/kpmctl" "{{KPMCTL}}"
+    MSYS_NO_PATHCONV=1 adb shell "chmod 755 {{KPMCTL}}"
+
+# 测试 KernelPatch 连接
+hello:
+    MSYS_NO_PATHCONV=1 adb shell "su -c '{{KPMCTL}} {{KEY}} hello'"
+
+# 列出已加载模块
+list:
+    MSYS_NO_PATHCONV=1 adb shell "su -c '{{KPMCTL}} {{KEY}} list'"
+
+# 加载 KPM: just load /sdcard/Download/demo-spawn.kpm "com.example.app"
+load path args="":
+    MSYS_NO_PATHCONV=1 adb shell "su -c '{{KPMCTL}} {{KEY}} load {{path}} {{args}}'"
+
+# 卸载 KPM: just unload demo-spawn
+unload name:
+    MSYS_NO_PATHCONV=1 adb shell "su -c '{{KPMCTL}} {{KEY}} unload {{name}}'"
+
+# 发送控制命令: just ctl demo-spawn release
+ctl name args:
+    MSYS_NO_PATHCONV=1 adb shell "su -c '{{KPMCTL}} {{KEY}} ctl {{name}} {{args}}'"
+
+# 放行冻结的进程: just release
+release:
+    MSYS_NO_PATHCONV=1 adb shell "su -c '{{KPMCTL}} {{KEY}} ctl demo-spawn release'"
+
+# 模块详情: just info demo-spawn
+info name:
+    MSYS_NO_PATHCONV=1 adb shell "su -c '{{KPMCTL}} {{KEY}} info {{name}}'"
